@@ -19,12 +19,20 @@ services:
     # `docker compose up --build` overrides it for local development.
     image: ${MAILINDEX_IMAGE:-ghcr.io/alexanderkrauck/mailindex-mcp:latest}
     build: .
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       EMAILSERVER_DATABASE_URL: postgresql://emailserver:${POSTGRES_PASSWORD}@postgres:5432/emailserver
       EMAILSERVER_AUTH_MODE: google
+      EMAILSERVER_SYNC_ACCOUNT_CONCURRENCY: ${EMAILSERVER_SYNC_ACCOUNT_CONCURRENCY:-2}
+      EMAILSERVER_SYNC_JOB_TIMEOUT_SECONDS: ${EMAILSERVER_SYNC_JOB_TIMEOUT_SECONDS:-300}
+      EMAILSERVER_SYNC_JOB_CLEANUP_SECONDS: ${EMAILSERVER_SYNC_JOB_CLEANUP_SECONDS:-5}
+      EMAILSERVER_SYNC_WATCHDOG_TIMEOUT_SECONDS: ${EMAILSERVER_SYNC_WATCHDOG_TIMEOUT_SECONDS:-30}
+      EMAILSERVER_SYNC_STALE_AFTER_SECONDS: ${EMAILSERVER_SYNC_STALE_AFTER_SECONDS:-900}
+      EMAILSERVER_IMAP_COMMAND_TIMEOUT_SECONDS: ${EMAILSERVER_IMAP_COMMAND_TIMEOUT_SECONDS:-60}
+      EMAILSERVER_IMAP_CLEANUP_TIMEOUT_SECONDS: ${EMAILSERVER_IMAP_CLEANUP_TIMEOUT_SECONDS:-5}
       # The reconciler tombstones; physical removal follows after the grace period,
       # so a wrong deletion inference stays recoverable.
       EMAILSERVER_UPSTREAM_DELETE_POLICY: ${EMAILSERVER_UPSTREAM_DELETE_POLICY:-tombstone}

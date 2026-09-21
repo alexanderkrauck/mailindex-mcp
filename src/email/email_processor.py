@@ -71,14 +71,19 @@ def mailbox_key(account: SMTPConfig) -> tuple[str, int, str]:
     return (account.host, account.port, (account.username or "").lower())
 
 
-def acquire_mailbox_lease(db, account: SMTPConfig, *, seconds: int) -> str | None:
+def acquire_mailbox_lease(db, account: SMTPConfig, *, seconds: float, token: str | None = None) -> str | None:
     """Take the sync lease on every account row sharing this mailbox.
 
     Returns a token, or None if any of them is already held. One statement, so
     there is no window between testing and taking.
     """
+    from src.config import settings
+
     now = datetime.now(tz=timezone.utc)
-    token = uuid.uuid4().hex
+    seconds = min(seconds, settings.sync_job_timeout_seconds + settings.sync_job_cleanup_seconds)
+    if seconds <= 0:
+        return None
+    token = token or uuid.uuid4().hex
     host, port, username = mailbox_key(account)
     siblings = (
         db.query(SMTPConfig)
@@ -118,18 +123,31 @@ def acquire_mailbox_lease(db, account: SMTPConfig, *, seconds: int) -> str | Non
 
 
 def refresh_mailbox_lease(token: str, *, seconds: int) -> bool:
-    """Extend a held mailbox lease. Uses its own session so it can run concurrently."""
+    """Refresh without resurrecting or extending beyond the original attempt cap."""
+    from src.config import settings
+
     now = datetime.now(tz=timezone.utc)
     with SessionLocal.begin() as db:
-        updated = (
-            db.query(SMTPConfig)
-            .filter(SMTPConfig.sync_lock_token == token)
-            .update(
-                {SMTPConfig.sync_lock_expires_at: now + timedelta(seconds=seconds)},
-                synchronize_session=False,
-            )
-        )
-    return bool(updated)
+        rows = db.query(SMTPConfig).filter(
+            SMTPConfig.sync_lock_token == token,
+        ).order_by(SMTPConfig.id).with_for_update().all()
+        if not rows:
+            return False
+        expirations = []
+        for account in rows:
+            started = account.sync_locked_at
+            expires = account.sync_lock_expires_at
+            if started is None or expires is None:
+                return False
+            started = started.replace(tzinfo=timezone.utc) if started.tzinfo is None else started
+            expires = expires.replace(tzinfo=timezone.utc) if expires.tzinfo is None else expires
+            cap = started + timedelta(seconds=settings.sync_job_timeout_seconds + settings.sync_job_cleanup_seconds)
+            if now >= min(expires, cap):
+                return False
+            expirations.append(min(now + timedelta(seconds=seconds), cap))
+        for account, expires in zip(rows, expirations, strict=True):
+            account.sync_lock_expires_at = expires
+    return True
 
 
 def release_mailbox_lease(db, token: str) -> None:
@@ -404,7 +422,7 @@ class EmailProcessor:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _process_server(self, config: SMTPConfig, force: bool = False):
+    async def _process_server(self, config: SMTPConfig, force: bool = False, *, leased: bool = False):
         """Process emails from a single server."""
         config_id = config.id
         completed = False
@@ -417,18 +435,16 @@ class EmailProcessor:
                 retry_after = retry_after.replace(tzinfo=timezone.utc)
             if not force and retry_after and datetime.now(tz=timezone.utc) < retry_after:
                 return False
-            lock_token = self._acquire_sync_lease(config_id)
+            lock_token = (
+                self._active_lock_tokens.get(config_id) if leased else self._acquire_sync_lease(config_id)
+            )
             if not lock_token:
                 logger.info("Skipping account %s because another worker holds its sync lock", config_id)
                 return False
             self._active_lock_tokens[config_id] = lock_token
             self._mark_sync_attempt(config_id)
-            heartbeat_task = asyncio.create_task(
-                self._maintain_sync_lease(
-                    config_id,
-                    asyncio.current_task(),
-                )
-            )
+            # Supervised attempts get one finite lease, never a background renewal.
+            # The external process supervisor, not cancellation, owns their lifetime.
 
             if config.provider == "gmail" and config.auth_type == "oauth2":
                 await self._process_gmail_api(config)
@@ -504,9 +520,9 @@ class EmailProcessor:
                     self._mark_sync_success(config_id)
                 except Exception as e:
                     logger.error("Error updating last_check for config %s: %s", config_id, e)
-            if lock_token:
+            if lock_token and not leased:
                 self._release_sync_lease(config_id, lock_token)
-            self._active_lock_tokens.pop(config_id, None)
+                self._active_lock_tokens.pop(config_id, None)
 
         return completed
 
@@ -558,23 +574,7 @@ class EmailProcessor:
         token = self._active_lock_tokens.get(config_id)
         if not token:
             return False
-        now = datetime.now(tz=timezone.utc)
-        with SessionLocal.begin() as db:
-            updated = (
-                db.query(SMTPConfig)
-                .filter(
-                    SMTPConfig.id == config_id,
-                    SMTPConfig.sync_lock_token == token,
-                )
-                .update(
-                    {
-                        SMTPConfig.sync_lock_expires_at: now
-                        + timedelta(seconds=settings.sync_lease_seconds)
-                    },
-                    synchronize_session=False,
-                )
-            )
-        return bool(updated)
+        return refresh_mailbox_lease(token, seconds=settings.sync_lease_seconds)
 
     async def _maintain_sync_lease(
         self,
@@ -1231,15 +1231,17 @@ class EmailProcessor:
                 if not config.credential_ciphertext:
                     return {"error": "Mailbox password is not configured"}
 
-                # Create a detached copy before closing the session, matching
-                # the pattern used in _process_all_servers. This avoids nested
-                # session conflicts when _process_server opens its own sessions.
-                config_copy = SMTPConfig.create_detached(config)
+            from src.config import settings
+            from src.sync_health import fresh, heartbeat, read_record, runtime_dir, write_record
 
-            completed = await self._process_server(config_copy, force=True)
-            if not completed:
-                return {"error": f"Processing failed for {config_copy.name}; check server logs"}
-            return {"success": True, "message": f"Processed emails from {config_copy.name}"}
+            root = runtime_dir()
+            supervisor = read_record(root / "supervisor.json")
+            if not fresh(supervisor, settings.sync_watchdog_timeout_seconds):
+                return {"error": "Synchronization supervisor is unavailable"}
+            # One bounded, coalescing request per account. The supervisor owns
+            # concurrency and deadlines for manual and automatic work alike.
+            write_record(root / f"request-{server_id}.json", heartbeat(account_id=server_id))
+            return {"success": True, "queued": True, "message": "Synchronization queued"}
 
         except Exception as e:
             logger.error("Manual processing failed for server %s: %s", server_id, e)

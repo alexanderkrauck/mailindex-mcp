@@ -89,6 +89,32 @@ async def test_google_oauth_provider_emits_audience_bound_mcp_challenge():
         assert (await client.get("/.well-known/oauth-authorization-server")).status_code == 200
 
 
+def test_chatgpt_cimd_client_assertion_uses_advertised_token_endpoint():
+    from types import SimpleNamespace
+
+    from fastmcp.server.auth.auth import PrivateKeyJWTClientAuthenticator
+
+    from src.security.fastmcp_compat import apply_fastmcp_cimd_token_audience_fix
+
+    apply_fastmcp_cimd_token_audience_fix()
+    authenticator = PrivateKeyJWTClientAuthenticator(
+        provider=SimpleNamespace(base_url="https://mail.example.com/"),
+        cimd_manager=object(),
+        token_endpoint_url="https://mail.example.com//token",
+    )
+
+    assert authenticator._token_endpoint_url == "https://mail.example.com/token"
+
+
+def test_google_oauth_repeat_authorization_requests_refresh_token():
+    from src.security.auth import GOOGLE_AUTHORIZE_PARAMS
+
+    assert GOOGLE_AUTHORIZE_PARAMS == {
+        "access_type": "offline",
+        "prompt": "consent select_account",
+    }
+
+
 def test_unverified_google_email_is_rejected():
     from fastapi import HTTPException
 

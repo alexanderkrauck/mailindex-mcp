@@ -27,6 +27,7 @@ services:
     image: ${MAILINDEX_IMAGE:-ghcr.io/alexanderkrauck/mailindex-mcp:latest}
     build: .
     container_name: email-server
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,14 +39,20 @@ services:
       - EMAILSERVER_API_HOST=0.0.0.0
       - EMAILSERVER_API_PORT=8000
       - EMAILSERVER_LOG_LEVEL=INFO
+      - EMAILSERVER_SYNC_ACCOUNT_CONCURRENCY=${EMAILSERVER_SYNC_ACCOUNT_CONCURRENCY:-2}
+      - EMAILSERVER_SYNC_JOB_TIMEOUT_SECONDS=${EMAILSERVER_SYNC_JOB_TIMEOUT_SECONDS:-300}
+      - EMAILSERVER_SYNC_JOB_CLEANUP_SECONDS=${EMAILSERVER_SYNC_JOB_CLEANUP_SECONDS:-5}
+      - EMAILSERVER_SYNC_WATCHDOG_TIMEOUT_SECONDS=${EMAILSERVER_SYNC_WATCHDOG_TIMEOUT_SECONDS:-30}
+      - EMAILSERVER_SYNC_STALE_AFTER_SECONDS=${EMAILSERVER_SYNC_STALE_AFTER_SECONDS:-900}
+      - EMAILSERVER_IMAP_COMMAND_TIMEOUT_SECONDS=${EMAILSERVER_IMAP_COMMAND_TIMEOUT_SECONDS:-60}
+      - EMAILSERVER_IMAP_CLEANUP_TIMEOUT_SECONDS=${EMAILSERVER_IMAP_CLEANUP_TIMEOUT_SECONDS:-5}
       # The reconciler tombstones; a message leaves search at once and is removed
       # physically after the grace period. hard_delete would let a single wrong
       # inference destroy mail irreversibly.
       - EMAILSERVER_UPSTREAM_DELETE_POLICY=${EMAILSERVER_UPSTREAM_DELETE_POLICY:-tombstone}
       - EMAILSERVER_TOMBSTONE_GRACE_DAYS=${EMAILSERVER_TOMBSTONE_GRACE_DAYS:-7}
-      # Seconds between full folder censuses. Overridable because a census that
-      # cannot complete has no way to stop itself: the interval guard is only
-      # cleared after the pass succeeds, so a failing pass retries forever.
+      # Seconds between full folder censuses. Sync job deadlines and independent
+      # workers bound failures without letting a slow account block all others.
       - EMAILSERVER_DELETION_RECONCILE_INTERVAL=${EMAILSERVER_DELETION_RECONCILE_INTERVAL:-300}
       - EMAILSERVER_AUTH_MODE=${EMAILSERVER_AUTH_MODE:-development}
       - EMAILSERVER_API_TOKEN=${EMAILSERVER_API_TOKEN:-}

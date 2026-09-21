@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 # inside final_app, and a mounted sub-app gets its own state object. Reading the
 # flag off request.app there would always find it missing.
 DATABASE_READY = False
+DATABASE_CHECKED_AT = 0.0
+DATABASE_PREPARED = False
 
 
 async def _prepare_database(app: FastAPI) -> None:
@@ -58,9 +61,31 @@ async def _prepare_database(app: FastAPI) -> None:
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
-    global DATABASE_READY
-    DATABASE_READY = True
-    app.state.processing_task = asyncio.create_task(email_processor.start_processing())
+    global DATABASE_READY, DATABASE_CHECKED_AT, DATABASE_PREPARED
+    DATABASE_READY = DATABASE_PREPARED = True
+    DATABASE_CHECKED_AT = time.monotonic()
+    # Never start provider work in the API event loop. python -m src.main owns it.
+
+
+async def _api_heartbeat():
+    from sqlalchemy import text
+
+    from src.database.connection import engine
+    from src.sync_health import heartbeat, runtime_dir, write_record
+
+    global DATABASE_READY, DATABASE_CHECKED_AT
+    while True:
+        if DATABASE_PREPARED:
+            try:
+                with engine.connect() as connection:
+                    connection.execute(text("SELECT 1"))
+                DATABASE_READY = True
+            except Exception:
+                DATABASE_READY = False
+            DATABASE_CHECKED_AT = time.monotonic()
+        # Runs on the actual API loop, not a thread that could mask a frozen loop.
+        write_record(runtime_dir() / "api.json", heartbeat(database_ready=DATABASE_READY))
+        await asyncio.sleep(settings.sync_scheduler_interval_seconds)
 
 
 @asynccontextmanager
@@ -68,13 +93,17 @@ async def service_lifespan(app: FastAPI):
     logger.info("Starting Email Server")
     app.state.processing_task = None
     preparation = asyncio.create_task(_prepare_database(app))
+    heartbeat_task = asyncio.create_task(_api_heartbeat())
     try:
         yield
     finally:
         logger.info("Shutting down Email Server")
         preparation.cancel()
+        heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await preparation
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
         await email_processor.stop_processing()
         email_sender_manager.cleanup()
         processing_task = getattr(app.state, "processing_task", None)
@@ -102,14 +131,22 @@ async def health_check():
     # 503 while the database is unreachable: the process is up and can describe
     # itself, but it cannot answer a question about anyone's mail, and a health
     # check that says otherwise is worse than no health check.
-    ready = DATABASE_READY
+    from src.sync_health import fresh, read_record, runtime_dir
+
+    record = read_record(runtime_dir() / "supervisor.json")
+    live = fresh(record, settings.sync_watchdog_timeout_seconds)
+    sync_healthy = bool(live and record.get("scheduler_healthy") and record.get("progress_healthy"))
+    ready = DATABASE_READY and time.monotonic() - DATABASE_CHECKED_AT < settings.sync_watchdog_timeout_seconds
+    healthy = ready and sync_healthy
     body = {
-        "status": "healthy" if ready else "degraded",
+        "status": "healthy" if healthy else "degraded",
         "service": "email-server",
         "database": "ready" if ready else "unavailable",
-        "processor_active": email_processor.processing,
+        "api_ready": ready,
+        "sync_healthy": sync_healthy,
+        "processor_active": live,
     }
-    return JSONResponse(status_code=200 if ready else 503, content=body)
+    return JSONResponse(status_code=200 if healthy else 503, content=body)
 
 
 api_app.include_router(email_router)

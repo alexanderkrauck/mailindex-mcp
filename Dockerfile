@@ -20,7 +20,7 @@ ARG TESSERACT_LANGS="eng deu fra ita spa nld por"
 # - postgresql-dev: needed for psycopg2
 # - tesseract-ocr: OCR for image attachments
 RUN apk add --no-cache \
-    gcc musl-dev libffi-dev openssl-dev python3-dev curl \
+    gcc musl-dev libffi-dev openssl-dev python3-dev curl tini \
     postgresql-dev \
     tesseract-ocr leptonica py3-pillow \
     $(for lang in $TESSERACT_LANGS; do echo "tesseract-ocr-data-$lang"; done) \
@@ -49,4 +49,9 @@ ENV EMAILSERVER_DATABASE_URL=postgresql://emailserver:emailserver@postgres:5432/
     FASTMCP_HOME=/data/fastmcp \
     PYTHONUNBUFFERED=1
 
+# Reap terminated sync/OCR descendants. src.main supervises the API process;
+# Docker's restart policy handles a watchdog-triggered exit, not health alone.
+ENTRYPOINT ["/sbin/tini", "--"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl --fail --silent --max-time 4 http://localhost:8000/api/v1/health || exit 1
 CMD ["python", "-m", "src.main"]

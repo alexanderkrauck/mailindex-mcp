@@ -57,11 +57,20 @@ class Settings(BaseSettings):
     # aioimaplib's own default is 10s, which a metadata FETCH over a large folder
     # exceeds routinely. A command that times out is reported as a sync failure.
     imap_command_timeout_seconds: float = 60.0
+    imap_cleanup_timeout_seconds: float = 5.0
     imap_backfill_messages_per_cycle: int = 500
     imap_max_message_size: int = 50 * 1024 * 1024
-    sync_account_concurrency: int = 4
+    sync_account_concurrency: int = 2
     sync_lease_seconds: int = 120
     sync_stale_after_seconds: int = 900
+    # Hard wall-clock work budget; cleanup is the only additional allowance.
+    sync_job_timeout_seconds: float = 300.0
+    sync_job_cleanup_seconds: float = 5.0
+    sync_watchdog_timeout_seconds: float = 30.0
+    sync_scheduler_interval_seconds: float = 2.0
+    sync_max_accounts: int = 10000
+    # Set in the supervised API child's environment, not required in deployment.
+    sync_external_supervisor: bool = False
 
     # Attachment Settings
     max_attachment_size: int = 10 * 1024 * 1024  # 10MB
