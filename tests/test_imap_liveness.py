@@ -127,12 +127,38 @@ async def imap_peer(mode="silent", logout="healthy", ssl_context=None):
         yield peer
     finally:
         server.close()
-        await server.wait_closed()
+        # Python 3.12 waits for active connections too: close/reap the peer
+        # handlers before waiting for the server, not the other way around.
         for writer in tuple(writers):
             writer.close()
         for task in tuple(tasks):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_peer_cleanup_closes_connections_before_waiting_for_server():
+    writer = None
+
+    async def use_peer():
+        nonlocal writer
+        async with imap_peer("healthy") as peer:
+            reader, writer = await asyncio.open_connection("127.0.0.1", peer.port)
+            # Reading the greeting proves the accepted handler has started.
+            assert await reader.readline() == b"* OK loopback IMAP ready\r\n"
+
+    operation = asyncio.create_task(use_peer())
+    try:
+        done, _ = await asyncio.wait({operation}, timeout=0.4)
+        assert done, "peer cleanup must close active connections before wait_closed"
+        operation.result()
+    finally:
+        # Release the old fixture too, so a regression fails rather than hangs.
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
+        await operation
 
 
 @pytest.fixture
