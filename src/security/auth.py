@@ -23,6 +23,12 @@ _mcp_auth_provider = None
 # A static token is the only secret protecting a single-user deployment.
 MIN_API_TOKEN_LENGTH = 32
 SINGLE_USER_CLIENT_ID = "single-user"
+GOOGLE_AUTHORIZE_PARAMS = {
+    "access_type": "offline",
+    # Google only returns a refresh token on repeat authorizations when consent
+    # is requested. Keep account selection as a second, space-delimited prompt.
+    "prompt": "consent select_account",
+}
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,10 @@ def build_mcp_auth_provider():
     if not settings.google_client_id or not settings.google_client_secret:
         raise RuntimeError("Google auth requires EMAILSERVER_GOOGLE_CLIENT_ID and EMAILSERVER_GOOGLE_CLIENT_SECRET")
 
+    from src.security.fastmcp_compat import apply_fastmcp_cimd_token_audience_fix
+
+    apply_fastmcp_cimd_token_audience_fix()
+
     from fastmcp.server.auth.providers.google import GoogleProvider
 
     _mcp_auth_provider = GoogleProvider(
@@ -73,7 +83,7 @@ def build_mcp_auth_provider():
         allowed_client_redirect_uris=settings.allowed_client_redirect_uris,
         jwt_signing_key=persistent_secret(settings.jwt_signing_key, "oauth-jwt.key"),
         require_authorization_consent=True,
-        extra_authorize_params={"access_type": "offline", "prompt": "select_account"},
+        extra_authorize_params=GOOGLE_AUTHORIZE_PARAMS,
     )
     return _mcp_auth_provider
 

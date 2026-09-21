@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
 from src.config import settings
+from src.database.sync_fence import SyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ if "postgresql" in settings.database_url:
 engine = create_engine(settings.database_url, **engine_kwargs)
 
 # Create session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=SyncSession)
 
 
 def get_db() -> Session:

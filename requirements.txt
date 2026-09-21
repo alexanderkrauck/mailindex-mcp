@@ -10,7 +10,8 @@ google-auth>=2.30.0
 google-auth-oauthlib>=1.2.0
 httpx>=0.27.0
 itsdangerous>=2.2.0
-aioimaplib>=1.0.0
+# imap_transport isolates private protocol fixes for this exact version.
+aioimaplib==2.0.1
 aiosmtpd>=1.4.0
 email-validator>=2.0.0
 python-dateutil>=2.8.0

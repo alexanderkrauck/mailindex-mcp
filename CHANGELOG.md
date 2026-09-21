@@ -2,6 +2,27 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.1.4 — 2026-09-21
+
+### Sync reliability
+
+- Bound the entire IMAP greeting/CAPABILITY handshake by an absolute deadline,
+  including the lock-holding library task. Pin `aioimaplib` to the tested 2.0.1
+  adapter contract. EOF, cancellation and failed logout abort broken connections
+  and settle their outstanding work rather than waiting indefinitely.
+- Schedule accounts independently in supervised worker processes. A hung account
+  no longer blocks the next polling round for every mailbox. An external process
+  supervisor enforces wall-clock deadlines even when asyncio cancellation fails.
+- Bound lease renewal by the job deadline and fence worker database writes by
+  ownership. Keep committed message batches and existing cursors when a job dies.
+- Report actual scheduler and account progress separately from API availability.
+  Detect wedged scheduling/event-loop work and recover through process supervision
+  and the container restart policy. Reap orphaned subprocesses with `tini`.
+- Preserve the deployed Google ID-token and FastMCP private-key JWT compatibility
+  fixes, previously missing from the published source.
+
+See [sync operations](docs/sync-operations.md) for deadlines, recovery and rollback.
+
 ## v0.1.0 — 2026-08-02
 
 First tagged release. Pre-1.0: the schema still changes between versions,

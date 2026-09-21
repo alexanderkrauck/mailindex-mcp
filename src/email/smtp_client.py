@@ -1,7 +1,6 @@
 """SMTP/IMAP client for connecting to email servers."""
 
 import asyncio
-import contextlib
 import json
 import logging
 import re
@@ -11,8 +10,7 @@ from email import message_from_bytes, policy
 from email.utils import getaddresses
 from typing import Dict, List, Optional
 
-import aioimaplib
-
+from src.email import imap_transport as aioimaplib
 from src.email.message_dates import parse_header_date
 from src.email.message_identity import stable_identity
 from src.models.smtp_config import SMTPConfig
@@ -44,6 +42,7 @@ class SMTPClient:
         self.config = smtp_config
         self.client = None
         self._connected = False
+        self._connection_error: Exception | None = None
         cursors = getattr(smtp_config, "sync_cursors", {}) or {}
         self._last_uids: Dict[str, int] = {
             folder: state["last_uid"] for folder, state in cursors.items() if state.get("last_uid") is not None
@@ -107,51 +106,54 @@ class SMTPClient:
 
             timeout = settings.imap_command_timeout_seconds
 
-            # Connect to IMAP server
-            if imap_use_ssl:
-                self.client = aioimaplib.IMAP4_SSL(
-                    host=self.config.host,
-                    port=self.config.port,
-                    ssl_context=ssl_context,
-                    timeout=timeout,
-                )
-            else:
-                self.client = aioimaplib.IMAP4(
-                    host=self.config.host, port=self.config.port, timeout=timeout
-                )
+            # One wall-clock budget covers TCP/TLS, greeting, CAPABILITY and
+            # authentication; progressing response lines cannot extend it.
+            async with asyncio.timeout(timeout):
+                if imap_use_ssl:
+                    self.client = aioimaplib.IMAP4_SSL(
+                        host=self.config.host,
+                        port=self.config.port,
+                        ssl_context=ssl_context,
+                        timeout=timeout,
+                    )
+                else:
+                    self.client = aioimaplib.IMAP4(
+                        host=self.config.host, port=self.config.port, timeout=timeout
+                    )
 
-            await self.client.wait_hello_from_server()
+                await self.client.wait_hello_from_server()
 
-            # Start TLS if required
-            if imap_use_tls and not imap_use_ssl:
-                await self.client.starttls(ssl_context=ssl_context)
+                if imap_use_tls and not imap_use_ssl:
+                    await self.client.starttls(ssl_context=ssl_context)
 
-            # Login
-            if getattr(self.config, "auth_type", "password") == "oauth2":
-                from src.security.provider_tokens import refresh_access_token
+                if getattr(self.config, "auth_type", "password") == "oauth2":
+                    from src.security.provider_tokens import refresh_access_token
 
-                access_token = await asyncio.to_thread(
-                    refresh_access_token, self.config.credential_ciphertext
-                )
-                login_response = await self.client.xoauth2(self.config.username, access_token.encode())
-            else:
-                login_response = await self.client.login(self.config.username, self.config.password)
+                    access_token = await asyncio.to_thread(
+                        refresh_access_token, self.config.credential_ciphertext
+                    )
+                    login_response = await self.client.xoauth2(self.config.username, access_token.encode())
+                else:
+                    login_response = await self.client.login(self.config.username, self.config.password)
 
             if login_response.result == "OK":
                 self._connected = True
+                self._connection_error = None
                 logger.info("Successfully connected to %s (%s)", self.config.name, self.config.host)
                 return True
-            logger.error(
-                "Login failed for %s: %s - %s",
-                self.config.name,
-                login_response.result,
-                getattr(login_response, "lines", []),
-            )
+            # Server-controlled response lines and exception reprs can contain
+            # credentials. Preserve the cause, but never write wire data to logs.
+            self._connection_error = PermissionError("IMAP authentication rejected")
+            logger.error("Login rejected for %s", self.config.name)
             await self.disconnect()
             return False
 
+        except asyncio.CancelledError:
+            await self.disconnect()
+            raise
         except Exception as e:
-            logger.error("Connection failed for %s: %s: %r", self.config.name, type(e).__name__, e)
+            self._connection_error = e
+            logger.error("Connection failed for %s: %s", self.config.name, type(e).__name__)
             await self.disconnect()
             return False
 
@@ -161,8 +163,9 @@ class SMTPClient:
         self.client = None
         self._connected = False
         if client:
-            with contextlib.suppress(Exception):
-                await client.logout()
+            from src.config import settings
+
+            await aioimaplib.close_client(client, settings.imap_cleanup_timeout_seconds)
             logger.info("Disconnected from %s", self.config.name)
 
     async def _ensure_connected(self) -> bool:
@@ -191,7 +194,7 @@ class SMTPClient:
             List[Dict]: A batch of parsed email dicts.
         """
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}")
+            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
 
         try:
             folders = await self._get_folders()
@@ -670,7 +673,7 @@ class SMTPClient:
     async def fetch_raw_email(self, folder: str, uid: int, uid_validity: int | None = None) -> bytes:
         """Refetch one original RFC822 message without retaining its binary."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}")
+            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
         selected = await self.client.select(f'"{folder}"')
         if selected.result != "OK":
             raise RuntimeError(f"Cannot select folder {folder}")
@@ -685,7 +688,7 @@ class SMTPClient:
     async def fetch_raw_by_message_id(self, message_id: str) -> bytes:
         """Resolve a legacy record that predates persisted UID provenance."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}")
+            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
         safe_message_id = message_id.replace('"', "")
         for folder in await self._get_folders():
             selected = await self.client.select(f'"{folder}"')
@@ -705,7 +708,7 @@ class SMTPClient:
     async def fetch_folder_state(self) -> dict[str, dict]:
         """Fetch UID and flag state only, for deletion/read-state reconciliation."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}")
+            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
         snapshots = {}
         for folder in await self._get_folders():
             selected = await self.client.select(f'"{folder}"')
