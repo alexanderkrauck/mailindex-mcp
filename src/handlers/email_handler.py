@@ -28,6 +28,7 @@ from src.security.account_connect_tokens import (
 from src.security.auth import get_current_user, owned_account_query
 from src.security.download_tokens import issue_download_token, verify_download_token
 from src.security.provider_tokens import GMAIL_MAIL_SCOPE, encode_oauth_credential
+from src.security.upload_tokens import verify_upload_token
 from src.services.attachment_service import owned_attachment, refetch_attachment_bytes
 from src.services.mail_service import (
     get_thread,
@@ -39,6 +40,7 @@ from src.services.mail_service import (
     serialize_attachment,
     serialize_email,
 )
+from src.services.upload_service import store_upload_stream
 from src.web_pages import (
     invalid_setup_page,
     password_form_page,
@@ -795,6 +797,70 @@ async def download_attachment(attachment_id: int, token: str, db: Session = Depe
             )
         },
     )
+
+
+@router.put("/uploads/{upload_id}")
+async def store_upload(
+    upload_id: str,
+    request: Request,
+    # Defaulted rather than required, so an absent token is refused by the
+    # verifier with the same 403 as a forged one. A missing grant and a bad grant
+    # are the same failure, and answering them differently only tells a prober
+    # which half of the request to fix.
+    token: str = "",
+    db: Session = Depends(get_db),
+):
+    """Receive the raw bytes of an outbound attachment into a reserved slot.
+
+    The mirror image of the attachment download above: there, a signed URL hands
+    bytes out; here, a signed URL takes them in. The body is streamed straight to
+    the volume rather than buffered, so the size limit is enforced against what
+    has actually arrived and a hostile client cannot spend the process's memory
+    before being refused.
+    """
+    try:
+        user_id = verify_upload_token(token, upload_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+
+    # A declared length that cannot fit is refused before a single byte is read.
+    # It is only a hint -- it may be absent or a lie -- so the streaming check in
+    # the service remains the authority, but an honest client is told immediately
+    # instead of uploading 2GB to be told at the end.
+    #
+    # isascii() as well as isdigit(), because str.isdigit() is true of Unicode
+    # digits like '\u00b2' that int() then refuses. h11 would never deliver one,
+    # but the header is attacker-controlled and an ASGI server that does is not
+    # worth an unhandled 500.
+    declared_length = request.headers.get("content-length")
+    if (
+        declared_length
+        and declared_length.isascii()
+        and declared_length.isdigit()
+        and int(declared_length) > settings.max_outbound_attachment_bytes
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Upload exceeds the {settings.max_outbound_attachment_bytes} "
+                "byte outbound attachment limit"
+            ),
+        )
+
+    try:
+        upload = await store_upload_stream(db, upload_id, user_id, request.stream())
+    except Exception:
+        # A rejected upload leaves the slot's row modified but uncommitted, and a
+        # dirty session would poison the retry the caller is about to make. Every
+        # exception, not just HTTPException: a slot swept mid-upload surfaces as
+        # a StaleDataError from the ORM, and skipping the rollback there leaves
+        # the connection pinned and answers the client with an opaque 500.
+        db.rollback()
+        raise
+    # Already a plain mapping of what was stored, deliberately: the service does
+    # not re-read the row to build it, so a TTL that lapses between the promote
+    # and this line cannot turn a successful upload into a 404.
+    return upload
 
 
 @router.post("/send")

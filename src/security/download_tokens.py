@@ -26,9 +26,13 @@ def _decode_segment(value: str) -> bytes:
     return decoded
 
 
+PURPOSE = "attachment_download"
+
+
 def issue_download_token(user_id: int, attachment_id: int) -> str:
     payload = json.dumps(
         {
+            "purpose": PURPOSE,
             "user_id": user_id,
             "attachment_id": attachment_id,
             "expires_at": int(time.time()) + settings.attachment_token_ttl_seconds,
@@ -53,6 +57,13 @@ def verify_download_token(token: str, attachment_id: int) -> int:
         if not hmac.compare_digest(signature, hmac.new(_key(), payload, hashlib.sha256).digest()):
             raise ValueError
         claims = json.loads(payload)
+        # Upload and download grants are signed with the same key, so only this
+        # claim keeps a write grant from being spent as a read grant. A missing
+        # purpose is accepted because tokens issued before the claim existed are
+        # still inside their TTL; a present-but-wrong one never is. Drop the
+        # fallback once the longest attachment TTL has elapsed past deployment.
+        if claims.get("purpose", PURPOSE) != PURPOSE:
+            raise ValueError
         if claims["attachment_id"] != attachment_id or claims["expires_at"] < int(time.time()):
             raise ValueError
         return int(claims["user_id"])

@@ -62,6 +62,14 @@ from src.services.mail_service import (
     owned_email_query,
     select_message_ids,
 )
+from src.services.upload_service import (
+    claim_uploads_for_send,
+    load_uploads,
+    measure_uploads,
+    outbound_attachments,
+    plan_upload_dispositions,
+    settle_uploads,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -678,11 +686,23 @@ async def save_draft(
     body_html: str = "",
     cc_addresses: list[str] | None = None,
     reply_to_email_id: int | None = None,
+    upload_ids: list[str] | None = None,
+    inline_upload_ids: list[str] | None = None,
 ) -> dict:
     """Store a draft in the mailbox, where any mail client will pick it up."""
     account = owned_account(db, user.id, account_id)
     _assert_writable(account)
     _rate_limit(user.id)
+
+    # One message, one cap, across both lists: an image embedded in the body is
+    # as much a part of the draft as a file appended to it. Refused before
+    # anything is measured, let alone claimed, so an ambiguous request costs a
+    # slot nothing.
+    _ordinary, inline_uploads, selected_uploads = plan_upload_dispositions(
+        upload_ids, inline_upload_ids
+    )
+    if len(selected_uploads) > settings.max_outbound_attachments:
+        raise HTTPException(status_code=400, detail="Too many outbound attachments")
 
     headers: dict[str, str] = {}
     if reply_to_email_id is not None:
@@ -699,40 +719,75 @@ async def save_draft(
                 references.append(parent.message_id)
             headers["References"] = " ".join(references[-100:])
 
-    raw = build_draft(
-        sender=account.account_name or account.username,
-        to_addresses=to_addresses,
-        cc_addresses=cc_addresses or [],
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-        headers=headers,
-    )
+    # Sized before anything is claimed, exactly as send_mail does it. The rows
+    # already record what arrived, so a draft that cannot fit is refused without
+    # touching a single slot -- where measuring after the claim cost two write
+    # transactions per named slot (one to take it, one to hand it back) for a
+    # request that was always going to be refused. measure_uploads only reads
+    # the recorded sizes; it never opens a payload.
+    if measure_uploads(db, user.id, selected_uploads) > settings.max_outbound_attachment_bytes:
+        raise HTTPException(status_code=400, detail="Outbound attachments exceed the configured limit")
 
-    if _is_gmail_api(account):
-        thread_id = None
-        if reply_to_email_id is not None:
-            thread_id = owned_email(db, user.id, reply_to_email_id).provider_thread_id
-        created = await _gmail(
-            db, account, lambda client: client.create_draft(raw, thread_id=thread_id)
+    # Claimed before any payload is read, and before the mailbox round trip. The
+    # APPEND in the middle is a long await, so a second draft naming the same
+    # slot would otherwise pass the same 'stored' check and file the same bytes
+    # a second time; one conditional UPDATE decides between them instead.
+    claimed = claim_uploads_for_send(db, user.id, selected_uploads) if selected_uploads else []
+    try:
+        uploads = load_uploads(db, claimed)
+
+        raw = build_draft(
+            sender=account.account_name or account.username,
+            to_addresses=to_addresses,
+            cc_addresses=cc_addresses or [],
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            headers=headers,
+            attachments=outbound_attachments(uploads, inline_uploads),
         )
-        return {
-            "success": True,
-            "folder": "DRAFT",
-            "draft_id": (created or {}).get("id"),
-            "bytes": len(raw),
-        }
 
-    async def operation(client):
-        folders = await list_folders(client)
-        drafts = next((f["name"] for f in folders if f["special_use"] == "drafts"), None)
-        if not drafts:
-            drafts = next((f["name"] for f in folders if f["name"].lower().endswith("drafts")), None)
-        if not drafts:
-            raise HTTPException(status_code=409, detail="This mailbox has no Drafts folder")
-        return drafts, await append_message(client, drafts, raw, flags=["\\Draft", "\\Seen"])
+        if _is_gmail_api(account):
+            thread_id = None
+            if reply_to_email_id is not None:
+                thread_id = owned_email(db, user.id, reply_to_email_id).provider_thread_id
+            created = await _gmail(
+                db, account, lambda client: client.create_draft(raw, thread_id=thread_id)
+            )
+            # Consumed only once the draft is actually in the mailbox; a failure
+            # above releases the slots so the same bytes can be filed on a retry.
+            # Defensively: the draft exists by now, so a bookkeeping failure
+            # that propagated would strand the slot in 'sending' and report a
+            # filed draft as a failure.
+            settle_uploads(db, claimed, outcome="sent")
+            return {
+                "success": True,
+                "folder": "DRAFT",
+                "draft_id": (created or {}).get("id"),
+                "bytes": len(raw),
+            }
 
-    drafts, uid = await _with_mailbox(db, account, operation)
+        async def operation(client):
+            folders = await list_folders(client)
+            drafts = next((f["name"] for f in folders if f["special_use"] == "drafts"), None)
+            if not drafts:
+                drafts = next((f["name"] for f in folders if f["name"].lower().endswith("drafts")), None)
+            if not drafts:
+                raise HTTPException(status_code=409, detail="This mailbox has no Drafts folder")
+            return drafts, await append_message(client, drafts, raw, flags=["\\Draft", "\\Seen"])
+
+        drafts, uid = await _with_mailbox(db, account, operation)
+    except BaseException:
+        # 'failed', and unlike the send path that is not a judgement call: a
+        # draft is filed, never delivered. A failed APPEND or create_draft
+        # leaves nothing in anybody's mailbox and no message on any wire, so
+        # the slots are honestly re-usable and an honest retry must not have to
+        # upload the bytes again. (A draft that was filed but whose response
+        # was lost costs at worst a duplicate draft in the owner's own Drafts
+        # folder -- not a message delivered twice.)
+        settle_uploads(db, claimed, outcome="failed")
+        raise
+    settle_uploads(db, claimed, outcome="sent")
     return {"success": True, "folder": drafts, "uid": uid, "bytes": len(raw)}
 
 
