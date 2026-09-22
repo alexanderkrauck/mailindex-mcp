@@ -13,6 +13,7 @@ from email.utils import make_msgid
 from typing import Dict, List, Optional, Union
 
 from src.database.connection import get_db_session
+from src.email.draft_builder import OutboundPart, plan_outbound_parts
 from src.models.smtp_config import SMTPConfig
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,30 @@ class EmailSender:
             finally:
                 self._server = None
 
+    @staticmethod
+    def _build_part(part: OutboundPart, *, inline: bool) -> MIMEBase:
+        """Render one already-validated part.
+
+        Every value here has been through ``plan_outbound_parts``: the type is
+        two safe tokens, the Content-ID is a bare token we bracket ourselves,
+        and the filename came out of ``sanitize_filename``. Nothing a caller
+        supplied is interpolated into a header as-is.
+        """
+        mime_part = MIMEBase(part.maintype, part.subtype)
+        mime_part.set_payload(part.data)
+        encoders.encode_base64(mime_part)
+        if inline:
+            # Content-ID is what a cid: URL resolves against; the inline
+            # disposition is what clients that ignore Content-ID look at.
+            # Real clients emit both, so both are sent.
+            mime_part.add_header("Content-ID", f"<{part.content_id}>")
+        mime_part.add_header(
+            "Content-Disposition",
+            "inline" if inline else "attachment",
+            filename=part.filename,
+        )
+        return mime_part
+
     async def send_email(
         self,
         to_addresses: List[str],
@@ -115,27 +140,17 @@ class EmailSender:
             return {"success": False, "message": "Failed to connect to SMTP server"}
 
         try:
-            # Create message
-            msg = MIMEMultipart("mixed")
-
-            # Set headers - use account_name if available, otherwise username
-            from_email = getattr(self.config, "account_name", self.config.username)
-            if not from_email or "@" not in from_email:
-                from_email = self.config.username  # fallback
-            msg["From"] = from_email
-            msg["To"] = ", ".join(to_addresses)
-            msg["Subject"] = subject
-            msg["Date"] = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
-            msg["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
-
-            if cc_addresses:
-                msg["Cc"] = ", ".join(cc_addresses)
-            if reply_to:
-                msg["Reply-To"] = reply_to
-            if in_reply_to:
-                msg["In-Reply-To"] = in_reply_to
-            if references:
-                msg["References"] = references
+            # Decide the structure before building anything: whether a related
+            # level is needed depends on which parts the HTML actually uses.
+            try:
+                inline_parts, attachment_parts = plan_outbound_parts(attachments, body_html)
+            except Exception as e:
+                logger.error("Error planning outbound attachments: %s", e)
+                return {
+                    "success": False,
+                    "message": "Failed to construct an outbound attachment",
+                    "delivery_state": "failed",
+                }
 
             # Create body container
             body_container = MIMEMultipart("alternative")
@@ -155,38 +170,73 @@ class EmailSender:
                 text_part = MIMEText("", "plain", "utf-8")
                 body_container.attach(text_part)
 
-            # Attach body to main message
-            msg.attach(body_container)
+            rendered_inline = []
+            rendered_attachments = []
+            for part, is_inline in [(p, True) for p in inline_parts] + [(p, False) for p in attachment_parts]:
+                try:
+                    (rendered_inline if is_inline else rendered_attachments).append(
+                        self._build_part(part, inline=is_inline)
+                    )
+                    logger.debug("Added %s part: %s", "inline" if is_inline else "attachment", part.filename)
+                except Exception as e:
+                    logger.error("Error adding attachment %s: %s", part.filename, e)
+                    return {
+                        "success": False,
+                        "message": "Failed to construct an outbound attachment",
+                        "delivery_state": "failed",
+                    }
 
-            # Add attachments
-            if attachments:
-                for attachment in attachments:
-                    try:
-                        part = MIMEBase("application", "octet-stream")
-                        part.set_payload(attachment["data"])
-                        encoders.encode_base64(part)
+            if rendered_inline:
+                # The body and the parts its cid: URLs point at have to share a
+                # multipart/related, or the references cannot resolve.
+                #
+                # type= is RFC 2387's required parameter naming the root part --
+                # the one a client should render and resolve the cid: URLs
+                # against. Apple Mail and Outlook both emit it; modern clients
+                # tolerate its absence, but matching real-client output exactly
+                # is the point. body_container is always the first child, so
+                # the declared type is read off it rather than hardcoded.
+                related = MIMEMultipart("related", type=body_container.get_content_type())
+                related.attach(body_container)
+                for part in rendered_inline:
+                    related.attach(part)
+                root = related
+            else:
+                root = body_container
 
-                        from src.email import sanitize_filename
+            if rendered_attachments:
+                msg = MIMEMultipart("mixed")
+                msg.attach(root)
+                for part in rendered_attachments:
+                    msg.attach(part)
+            elif rendered_inline:
+                # No ordinary attachments: a mixed level with one child buys
+                # nothing, so the related container is the message.
+                msg = root
+            else:
+                # Unchanged from before inline parts existed: a mixed wrapper
+                # around the alternative body, which is what already ships.
+                msg = MIMEMultipart("mixed")
+                msg.attach(body_container)
 
-                        filename = sanitize_filename(
-                            attachment.get("filename", "attachment")
-                        )
-                        part.add_header(
-                            "Content-Disposition",
-                            "attachment",
-                            filename=filename,
-                        )
+            # Set headers - use account_name if available, otherwise username
+            from_email = getattr(self.config, "account_name", self.config.username)
+            if not from_email or "@" not in from_email:
+                from_email = self.config.username  # fallback
+            msg["From"] = from_email
+            msg["To"] = ", ".join(to_addresses)
+            msg["Subject"] = subject
+            msg["Date"] = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+            msg["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
 
-                        msg.attach(part)
-                        logger.debug("Added attachment: %s", filename)
-
-                    except Exception as e:
-                        logger.error("Error adding attachment %s: %s", attachment.get("filename", "unknown"), e)
-                        return {
-                            "success": False,
-                            "message": "Failed to construct an outbound attachment",
-                            "delivery_state": "failed",
-                        }
+            if cc_addresses:
+                msg["Cc"] = ", ".join(cc_addresses)
+            if reply_to:
+                msg["Reply-To"] = reply_to
+            if in_reply_to:
+                msg["In-Reply-To"] = in_reply_to
+            if references:
+                msg["References"] = references
 
             # Collect all recipients
             all_recipients = to_addresses[:]

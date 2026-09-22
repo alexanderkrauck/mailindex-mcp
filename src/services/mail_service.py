@@ -24,6 +24,15 @@ from src.models.smtp_config import SMTPConfig
 from src.models.user import User
 from src.security.search_cursors import issue_search_cursor, verify_search_cursor
 from src.services.search_text import attachment_document, match_condition, message_document
+from src.services.upload_service import (
+    claim_uploads_for_send,
+    delivery_outcome,
+    load_uploads,
+    measure_uploads,
+    outbound_attachments,
+    plan_upload_dispositions,
+    settle_uploads,
+)
 
 
 class MailAccountDetails(TypedDict):
@@ -1447,7 +1456,14 @@ async def send_mail(
     recipients = payload.to_addresses + payload.cc_addresses + payload.bcc_addresses
     if not recipients or len(recipients) > settings.max_send_recipients:
         raise HTTPException(status_code=400, detail="Recipient count is outside the configured limit")
-    if len(attachments or []) > settings.max_outbound_attachments:
+    # Newly uploaded bytes and already-indexed attachments are parts of one
+    # message, so one cap governs both rather than each list separately -- and
+    # an embedded image is as much a part of the message as an appended file,
+    # so the two upload lists are weighed together as well.
+    upload_ids, inline_upload_ids, named_uploads = plan_upload_dispositions(
+        payload.upload_ids, payload.inline_upload_ids
+    )
+    if len(attachments or []) + len(named_uploads) > settings.max_outbound_attachments:
         raise HTTPException(status_code=400, detail="Too many outbound attachments")
     attachment_bytes = sum(len(item.get("data", b"")) for item in attachments or [])
     if attachment_bytes > settings.max_outbound_attachment_bytes:
@@ -1471,6 +1487,11 @@ async def send_mail(
         }
         for item in attachments or []
     ]
+    # The deduplicated lists, not the ones as spelled: naming the same slot twice is
+    # the same request as naming it once, and a retry that tidies its own argument
+    # must not read as a different one.
+    canonical_payload["upload_ids"] = upload_ids
+    canonical_payload["inline_upload_ids"] = inline_upload_ids
     canonical_payload["send_options"] = effective_send_options
     canonical = json.dumps(canonical_payload, separators=(",", ":"), sort_keys=True)
     request_hash = hashlib.sha256(canonical.encode()).hexdigest()
@@ -1493,40 +1514,108 @@ async def send_mail(
             }
         raise HTTPException(status_code=409, detail=f"Prior send is {existing.status}; it will not be retried")
 
-    audit = SendAudit(
-        owner_user_id=user.id,
-        smtp_config_id=account.id,
-        reply_to_email_id=reply_message.id if reply_message else None,
-        idempotency_key=key,
-        recipients_json=json.dumps(recipients),
-        subject=payload.subject,
-        request_hash=request_hash,
-        status="pending",
-    )
-    db.add(audit)
-    db.commit()
-    db.refresh(audit)
+    # Only now are the uploaded payloads claimed and read. A replay of an
+    # already-sent key returned above without touching them, which is what makes
+    # a genuine retry work: the slots it names are consumed, and the claim would
+    # refuse them. The hash stays identical across the two calls because
+    # upload_ids are server-generated, single-use identifiers carried in the
+    # payload itself, so naming them discriminates a request exactly as well as
+    # hashing their bytes would -- without needing bytes that a spent slot will
+    # no longer hand over.
+    #
+    # Sized before anything is claimed. The rows already record what arrived, so
+    # a message that cannot fit is refused without touching a single slot --
+    # where doing it after the claim cost two write transactions per named slot
+    # (one to take it, one to hand it back) for a request that was always going
+    # to be refused. The refusal path writes no SendAudit row and the rate limit
+    # is a COUNT over those rows, so that cost was unthrottled and repeatable.
+    #
+    # measure_uploads only reads the recorded sizes; it never opens a payload,
+    # so at stock caps this refuses a 500MB request without reading 500MB. Both
+    # upload lists are weighed together, because an embedded image and an
+    # appended file occupy the same message.
+    if attachment_bytes + measure_uploads(db, user.id, named_uploads) > settings.max_outbound_attachment_bytes:
+        raise HTTPException(status_code=400, detail="Outbound attachments exceed the configured limit")
 
-    result = await email_sender_manager.send_email_via_config(
-        smtp_config_id=account.id,
-        owner_user_id=user.id,
-        to_addresses=payload.to_addresses,
-        subject=payload.subject,
-        body_text=payload.body_text,
-        body_html=payload.body_html,
-        cc_addresses=payload.cc_addresses or None,
-        bcc_addresses=payload.bcc_addresses or None,
-        reply_to=payload.reply_to,
-        attachments=attachments,
-        **effective_send_options,
-    )
-    audit.status = "sent" if result.get("success") else result.get("delivery_state", "failed")
-    audit.provider_message_id = result.get("message_id")
-    audit.provider_response = json.dumps(result, default=str)[:10_000]
-    audit.completed_at = datetime.now(tz=timezone.utc)
-    db.commit()
-    if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("message", "SMTP send failed"))
+    # The claim comes first and the bytes second. Between reading a slot's state
+    # and consuming it there is a whole SMTP conversation, which is more than
+    # enough room for a second request to pass the same check and send the same
+    # payload again; moving the slot out of 'stored' in one conditional UPDATE is
+    # what makes "single use" true rather than merely likely.
+    #
+    # One claim over both lists, so a message that cannot have every part it
+    # names sends none of them -- and so a slot cannot be spent as an attachment
+    # by one request while another embeds it.
+    claimed = claim_uploads_for_send(db, user.id, named_uploads) if named_uploads else []
+    # What the slots' settlement will be told. It starts at the only thing that
+    # is true before a transport exists: nothing has been delivered, so the
+    # slots stay honestly re-sendable. It is widened exactly when a delivery
+    # attempt becomes possible, and narrowed again the moment the sender
+    # actually reports.
+    outcome = "failed"
+    try:
+        uploads = load_uploads(db, claimed)
+        outbound = list(attachments or []) + outbound_attachments(uploads, inline_upload_ids)
+
+        audit = SendAudit(
+            owner_user_id=user.id,
+            smtp_config_id=account.id,
+            reply_to_email_id=reply_message.id if reply_message else None,
+            idempotency_key=key,
+            recipients_json=json.dumps(recipients),
+            subject=payload.subject,
+            request_hash=request_hash,
+            status="pending",
+        )
+        db.add(audit)
+        db.commit()
+        db.refresh(audit)
+
+        # From here the message may reach an MTA, and anything that stops this
+        # coroutine without a reported result -- a cancelled request, a worker
+        # shutting down mid-conversation -- leaves delivery genuinely
+        # unestablished. The pessimistic value holds only until the sender
+        # answers.
+        outcome = "unknown"
+        result = await email_sender_manager.send_email_via_config(
+            smtp_config_id=account.id,
+            owner_user_id=user.id,
+            to_addresses=payload.to_addresses,
+            subject=payload.subject,
+            body_text=payload.body_text,
+            body_html=payload.body_html,
+            cc_addresses=payload.cc_addresses or None,
+            bcc_addresses=payload.bcc_addresses or None,
+            reply_to=payload.reply_to,
+            attachments=outbound or None,
+            **effective_send_options,
+        )
+        # The sender did report, so route what it said rather than the default.
+        # 'failed' means refused and the slots go back; 'unknown' and 'partial'
+        # mean the message may be -- or, for 'partial', demonstrably is --
+        # delivered, and those retire the slots instead of recycling them.
+        outcome = delivery_outcome(result)
+        audit.status = "sent" if result.get("success") else result.get("delivery_state", "failed")
+        audit.provider_message_id = result.get("message_id")
+        audit.provider_response = json.dumps(result, default=str)[:10_000]
+        audit.completed_at = datetime.now(tz=timezone.utc)
+        db.commit()
+        if not result.get("success"):
+            raise HTTPException(status_code=502, detail=result.get("message", "SMTP send failed"))
+    except BaseException:
+        # A refused send hands the slots back, so the caller can correct
+        # whatever failed and send the same bytes again without uploading them
+        # a second time -- but an *ambiguous* one must not, or the retry
+        # delivers the same confidential message twice. Defensively, because a
+        # cleanup that raises here would strand the very slots it exists to
+        # free.
+        settle_uploads(db, claimed, outcome=outcome)
+        raise
+    # Inside no try of its own but never able to raise: by this point the
+    # message is on the wire, and a bookkeeping failure that propagated would
+    # leave the slot stuck in 'sending' for the whole TTL while telling the
+    # caller a delivered message had failed.
+    settle_uploads(db, claimed, outcome=outcome)
     return {
         **result,
         "audit_id": audit.id,

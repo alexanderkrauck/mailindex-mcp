@@ -143,6 +143,19 @@ class Settings(BaseSettings):
     max_accounts_per_user: int = 20
     max_outbound_attachment_bytes: int = 25 * 1024 * 1024
     max_outbound_attachments: int = 20
+    # An AI client cannot hand the server a file: bytes would have to cross the
+    # conversation. It asks for an upload slot instead and PUTs the bytes to a
+    # signed URL, exactly mirroring how attachment downloads already work.
+    # The slot is short-lived because it is a write grant against this volume.
+    outbound_upload_ttl_seconds: int = 900
+    # Per owner, so one tenant cannot fill the data volume with slots nobody
+    # ever sends. Counted over pending uploads only; a consumed one is swept.
+    # The count is the binding constraint, not the byte budget: this many slots
+    # each filled to max_outbound_attachment_bytes is the true worst case a
+    # single tenant can park on a shared volume, so 10 x 25MiB = 250MiB keeps it
+    # level with the byte budget below rather than five times over it.
+    max_pending_uploads_per_user: int = 10
+    max_pending_upload_bytes_per_user: int = 250 * 1024 * 1024
 
     # Mailbox writes are ordinary behaviour: this is a mail client for an agent,
     # and moving, marking and deleting are what a mail client does. Safety lives

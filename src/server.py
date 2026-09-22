@@ -35,6 +35,11 @@ DATABASE_READY = False
 DATABASE_CHECKED_AT = 0.0
 DATABASE_PREPARED = False
 
+# Upload slots are swept on their own clock rather than on every heartbeat tick.
+# One minute is far below the shortest slot lifetime, so nothing expired lingers
+# meaningfully, and far above the tick rate, so the liveness loop stays cheap.
+UPLOAD_SWEEP_INTERVAL_SECONDS = 60.0
+
 
 async def _prepare_database(app: FastAPI) -> None:
     """Migrate, then start syncing. Keep trying rather than dying.
@@ -67,6 +72,69 @@ async def _prepare_database(app: FastAPI) -> None:
     # Never start provider work in the API event loop. python -m src.main owns it.
 
 
+def _sweep_outbound_uploads():
+    """Reclaim spent and expired upload slots, and the bytes they were holding.
+
+    The API process owns this because the API process is what created the slots:
+    a sync worker never sees an upload, and running it in several processes would
+    just have them contend over the same rows.
+    """
+    from src.database.connection import SessionLocal
+    from src.services.upload_service import sweep_outbound_uploads
+
+    with SessionLocal() as db:
+        return sweep_outbound_uploads(db)
+
+
+def _log_sweep_outcome(report) -> None:
+    """Say something when a pass matters, and nothing when it does not.
+
+    This ran with only ``if removed:``, so the one outcome an operator most
+    needs to see -- a pass that could not make progress -- was indistinguishable
+    from an idle deployment with nothing to sweep. Head-of-line blocking in the
+    bounded window therefore stayed invisible indefinitely while the volume
+    filled.
+
+    Three mutually exclusive signals, in descending severity, plus at most one
+    extra line when the volume refused an unlink:
+
+    - ``starved``    a full window produced nothing. Structurally unreachable
+      now, so this fires only on a regression -- which is the point.
+    - ``saturated``  the window was full and productive: a backlog. Ordinary
+      after a burst, worth attention if it persists.
+    - ``removed``    ordinary progress, as before.
+
+    A healthy idle pass is silent, because this runs every minute forever and
+    must not become log noise. Nothing here may raise: the heartbeat that calls
+    it is the liveness signal, and a logging problem must not stop it.
+    """
+    try:
+        if report.starved:
+            logger.warning(
+                "Outbound upload sweep made no progress: all %s rows in its window were "
+                "un-actionable. Expired payloads are not being reclaimed and the data "
+                "volume will grow until this is fixed.",
+                report.examined,
+            )
+        elif report.saturated:
+            logger.info(
+                "Swept %s expired outbound upload slots and filled the %s row window; "
+                "more remain for the next pass",
+                report.removed,
+                report.limit,
+            )
+        elif report.removed:
+            logger.info("Swept %s expired outbound upload slots", report.removed)
+        if report.freed_retained_payloads:
+            logger.warning(
+                "Freed %s retained outbound upload payload(s) the retirement could not "
+                "remove; the data volume may be refusing unlinks",
+                report.freed_retained_payloads,
+            )
+    except Exception as exc:
+        logger.debug("Could not report the outbound upload sweep outcome: %s", exc)
+
+
 async def _api_heartbeat():
     from sqlalchemy import text
 
@@ -74,6 +142,7 @@ async def _api_heartbeat():
     from src.sync_health import heartbeat, runtime_dir, write_record
 
     global DATABASE_READY, DATABASE_CHECKED_AT
+    next_sweep = 0.0
     while True:
         if DATABASE_PREPARED:
             try:
@@ -83,6 +152,19 @@ async def _api_heartbeat():
             except Exception:
                 DATABASE_READY = False
             DATABASE_CHECKED_AT = time.monotonic()
+            # Housekeeping rides along on the liveness tick, but on its own, much
+            # slower clock: the heartbeat runs every couple of seconds and a sweep
+            # is a write against the whole table.
+            if DATABASE_READY and time.monotonic() >= next_sweep:
+                next_sweep = time.monotonic() + UPLOAD_SWEEP_INTERVAL_SECONDS
+                try:
+                    _log_sweep_outcome(_sweep_outbound_uploads())
+                except Exception as exc:
+                    # A failed sweep costs disk space. A heartbeat that stops
+                    # costs the health check, so this may never propagate.
+                    logger.warning(
+                        "Outbound upload sweep failed (%s: %s)", type(exc).__name__, exc
+                    )
         # Runs on the actual API loop, not a thread that could mask a frozen loop.
         write_record(runtime_dir() / "api.json", heartbeat(database_ready=DATABASE_READY))
         await asyncio.sleep(settings.sync_scheduler_interval_seconds)

@@ -3,7 +3,7 @@
   "name": "io.github.alexanderkrauck/mailindex-mcp",
   "title": "mailindex-mcp",
   "description": "Search, move, mark, delete and draft your real mail over a self-hosted index.",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "websiteUrl": "https://github.com/alexanderkrauck/mailindex-mcp",
   "repository": {
     "url": "https://github.com/alexanderkrauck/mailindex-mcp",

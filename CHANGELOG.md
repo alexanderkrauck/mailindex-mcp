@@ -2,6 +2,31 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.2.0 — 2026-09-22
+
+### Outbound attachments
+
+- Send files with a message, as ordinary attachments or embedded in the body.
+  An AI client cannot hand the server bytes -- they would have to cross the
+  conversation -- so `begin_attachment_upload` reserves a slot and returns a
+  signed URL to PUT to, mirroring how attachment downloads already work.
+  `send_mail` and `save_draft` take `upload_ids` for ordinary attachments and
+  `inline_upload_ids` for embedded ones, and both lists may be used at once.
+- Compose the MIME tree the way a mail client does: `multipart/related` around
+  the body and its inline parts, ordinary attachments beside it in
+  `multipart/mixed`, and each part carrying its real content type rather than
+  `application/octet-stream`. An inline part is referenced from the HTML body
+  by the `content_id` the reservation returns; one that nothing references is
+  delivered as an ordinary attachment rather than silently dropped.
+- Derive every `Content-ID` server-side, so no client-supplied text reaches a
+  MIME header.
+- Bound what one owner can park on the shared volume: slot count, bytes, and a
+  slot lifetime. Bytes are charged as they arrive, not as they are declared.
+- Settle a slot on what the transport actually reported. A send whose outcome
+  is unknown -- a timeout, a disconnect, a partial acceptance -- retires its
+  slots rather than returning them, because the alternative is delivering
+  confidential mail twice on a guess.
+
 ## v0.1.4 — 2026-09-21
 
 ### Sync reliability
