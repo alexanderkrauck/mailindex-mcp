@@ -72,6 +72,20 @@ class Settings(BaseSettings):
     # Set in the supervised API child's environment, not required in deployment.
     sync_external_supervisor: bool = False
 
+    # Time to establish a connection: TCP, TLS handshake and AUTH. Bounded
+    # deliberately tightly -- a dead or blackholed host must fail the request
+    # rather than hang it -- but above the old hardcoded 10s, which a TLS
+    # handshake over a slow mobile link can genuinely exceed.
+    smtp_connect_timeout_seconds: float = 15.0
+    # Time for a command once connected, and therefore the budget the DATA
+    # phase runs under. The same hardcoded 10s used to govern the socket for
+    # its whole life, so a large attachment on a slow link tripped a
+    # *connect*-sized timeout mid-transfer -- and a timeout there is ambiguous,
+    # which retires the caller's upload slot. A 25 MiB attachment is ~34 MiB on
+    # the wire after base64; 120s puts the floor at roughly 285 KB/s, which a
+    # slow link still meets, while a hung socket is still bounded.
+    smtp_command_timeout_seconds: float = 120.0
+
     # Attachment Settings
     max_attachment_size: int = 10 * 1024 * 1024  # 10MB
 

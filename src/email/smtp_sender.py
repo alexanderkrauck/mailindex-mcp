@@ -3,6 +3,7 @@
 import base64
 import logging
 import smtplib
+import socket
 import ssl
 from datetime import datetime, timezone
 from email import encoders
@@ -12,11 +13,75 @@ from email.mime.text import MIMEText
 from email.utils import make_msgid
 from typing import Dict, List, Optional, Union
 
+from src.config import settings
 from src.database.connection import get_db_session
 from src.email.draft_builder import OutboundPart, plan_outbound_parts
 from src.models.smtp_config import SMTPConfig
 
 logger = logging.getLogger(__name__)
+
+# Raised by a socket that is no longer there, at any point in a conversation.
+# smtplib.SMTPException derives from OSError, and socket.timeout is an alias of
+# TimeoutError since 3.10, but all four are named so the intent survives a
+# future where that stops being true.
+_DEAD_CONNECTION_ERRORS = (
+    smtplib.SMTPServerDisconnected,
+    smtplib.SMTPException,
+    OSError,
+    socket.timeout,
+)
+
+
+class _TransmissionTracker:
+    """Records whether smtplib entered the DATA phase on this connection.
+
+    This is the evidence the failure classification turns on, and it is
+    deliberately only available on connections *this module built*. smtplib
+    runs a transaction as MAIL FROM -> RCPT TO -> DATA, and ``data()`` is the
+    only step that puts message content on the wire. A disconnect before it is
+    therefore a provable non-send; a disconnect at or after it is ambiguous,
+    because the bytes may already have reached the MTA.
+
+    ``message_data_started`` is reset by ``send_email`` immediately before each
+    handover, so it always answers "during *this* send", never "ever on this
+    reused connection".
+
+    Any object that is not one of these -- an injected double, a connection
+    built elsewhere -- reports no evidence at all, and an absent answer is read
+    as ambiguous. Losing an upload slot is recoverable; delivering confidential
+    mail twice is not.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.message_data_started = False
+        super().__init__(*args, **kwargs)
+
+    def data(self, msg):
+        # Set *before* delegating, not after: the whole point is to catch a
+        # failure that happens inside this call. This also flips on the bare
+        # "DATA" command that precedes the content, so a disconnect in that
+        # narrow window is classified ambiguous even though nothing was
+        # written -- the conservative direction, on purpose.
+        self.message_data_started = True
+        return super().data(msg)
+
+
+class _TrackedSMTP(_TransmissionTracker, smtplib.SMTP):
+    """STARTTLS/plain connection carrying DATA-phase evidence."""
+
+
+class _TrackedSMTP_SSL(_TransmissionTracker, smtplib.SMTP_SSL):
+    """Implicit-TLS connection carrying DATA-phase evidence."""
+
+
+def _transmission_provably_not_started(server) -> bool:
+    """True only when this connection can *prove* no message bytes were sent.
+
+    ``is False`` rather than ``not ...`` is load-bearing: a foreign object
+    reports ``None``, which is "no evidence", and no evidence must never be
+    mistaken for proof of a non-send.
+    """
+    return getattr(server, "message_data_started", None) is False
 
 
 class EmailSender:
@@ -39,14 +104,19 @@ class EmailSender:
 
             if smtp_use_ssl:
                 # Use SSL connection (typically port 465)
-                self._server = smtplib.SMTP_SSL(
-                    smtp_host, smtp_port, timeout=10, context=ssl.create_default_context()
+                self._server = _TrackedSMTP_SSL(
+                    smtp_host,
+                    smtp_port,
+                    timeout=settings.smtp_connect_timeout_seconds,
+                    context=ssl.create_default_context(),
                 )
             else:
                 if not smtp_use_tls:
                     raise ValueError("Plaintext SMTP is disabled; configure SSL or STARTTLS")
                 # Use regular connection with optional TLS (typically port 587)
-                self._server = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
+                self._server = _TrackedSMTP(
+                    smtp_host, smtp_port, timeout=settings.smtp_connect_timeout_seconds
+                )
                 if smtp_use_tls:
                     context = ssl.create_default_context()
                     self._server.starttls(context=context)
@@ -63,6 +133,23 @@ class EmailSender:
                     raise smtplib.SMTPAuthenticationError(code, response)
             else:
                 self._server.login(self.config.username, self.config.password)
+
+            # Connect and AUTH are done, so the tight connect budget has served
+            # its purpose. smtplib hands the same socket timeout to the data
+            # phase, where a large attachment on a slow link needs far longer --
+            # and a timeout *there* is ambiguous, which costs the caller their
+            # upload slot for a message that may never have left.
+            try:
+                if self._server.sock is not None:
+                    self._server.sock.settimeout(settings.smtp_command_timeout_seconds)
+                self._server.timeout = settings.smtp_command_timeout_seconds
+            except OSError as e:
+                # A socket that cannot be reconfigured is not a reason to fail
+                # a connection that otherwise authenticated; it just keeps the
+                # connect-sized budget.
+                logger.warning(
+                    "Could not widen the SMTP socket timeout for %s: %s", self.config.name, e
+                )
             logger.info("Connected to SMTP server %s", self.config.name)
             return True
 
@@ -105,6 +192,65 @@ class EmailSender:
         )
         return mime_part
 
+    async def _ensure_live_connection(self) -> bool:
+        """Reconnect when the cached connection is gone. Never raises.
+
+        Every SMTP server closes an idle connection after a few minutes, and
+        the cached socket gives no sign of it: the file descriptor still looks
+        open, so the first send after an idle period wrote into a closed pipe
+        and died with SMTPServerDisconnected -- an *ambiguous* outcome for a
+        message that had not been sent at all.
+
+        A NOOP is the standard liveness probe, and the cheapest possible
+        round-trip. Reusing a verified connection is preferred over an
+        unconditional reconnect-per-send because a reconnect is a full TCP
+        handshake, TLS handshake and AUTH against the provider on every single
+        send -- materially slower, and for providers that rate-limit
+        authentication attempts, a new failure mode. The probe keeps the
+        cache's benefit and removes its hazard.
+
+        Probing is also *safe* in a way reconnecting mid-conversation is not:
+        it runs before any transaction begins, so a failure here is proof that
+        nothing was transmitted.
+
+        Only connections this class built are probed. A connection injected
+        from outside belongs to whoever injected it -- its lifetime is not this
+        class's to manage, and it need not speak NOOP at all.
+        """
+        if self._server is None:
+            return await self.connect()
+
+        if not isinstance(self._server, _TransmissionTracker):
+            # Somebody else's connection. Use it exactly as it is.
+            return True
+
+        try:
+            code, _ = self._server.noop()
+            if code == 250:
+                return True
+            logger.warning(
+                "SMTP NOOP returned %s for %s; reconnecting", code, self.config.name
+            )
+        except _DEAD_CONNECTION_ERRORS as e:
+            logger.info(
+                "Cached SMTP connection for %s is stale (%s: %s); reconnecting",
+                self.config.name,
+                type(e).__name__,
+                e,
+            )
+        except Exception as e:
+            # A probe must never be able to raise out of send_email: an
+            # unexpected failure here is still just a reason to rebuild the
+            # connection, and it happens before any transaction starts.
+            logger.warning(
+                "Unexpected error probing the SMTP connection for %s (%s: %s); reconnecting",
+                self.config.name,
+                type(e).__name__,
+                e,
+            )
+        self.disconnect()
+        return await self.connect()
+
     async def send_email(
         self,
         to_addresses: List[str],
@@ -136,7 +282,7 @@ class EmailSender:
         Returns:
             Dict with 'success' bool and 'message' string
         """
-        if not self._server and not await self.connect():
+        if not await self._ensure_live_connection():
             return {"success": False, "message": "Failed to connect to SMTP server"}
 
         try:
@@ -246,6 +392,10 @@ class EmailSender:
                 all_recipients.extend(bcc_addresses)
 
             # Send email
+            # Reset immediately before the handover, so the evidence below
+            # answers "during this send" rather than "ever on this connection".
+            if isinstance(self._server, _TransmissionTracker):
+                self._server.message_data_started = False
             refused = self._server.send_message(msg, to_addrs=all_recipients)
             if refused:
                 refused_addresses = sorted(refused)
@@ -276,9 +426,34 @@ class EmailSender:
             }
 
         except (TimeoutError, smtplib.SMTPServerDisconnected) as e:
+            # The distinction this branch draws is the safety-critical one, and
+            # it is drawn only on positive evidence.
+            #
+            # smtplib runs a transaction as MAIL FROM -> RCPT TO -> DATA, and
+            # only ``data()`` puts message content on the wire. A tracked
+            # connection that never reached ``data()`` during *this* send
+            # therefore proves the message was not transmitted: the failure
+            # came from the greeting, MAIL FROM or RCPT TO, every one of which
+            # precedes any content. That is a definite non-send, and it must be
+            # reported as 'failed' so the caller's upload slot returns to
+            # 'stored' and an honest retry works without re-uploading.
+            #
+            # Everything else stays 'unknown' -- reached DATA, or no evidence
+            # at all -- because the bytes may have arrived and a retry would
+            # deliver the same confidential message twice. There is no
+            # automatic resend on this path: the caller decides, and the slot
+            # is retired precisely so they cannot silently duplicate.
+            provably_not_transmitted = _transmission_provably_not_started(self._server)
+            self.disconnect()
+            if provably_not_transmitted:
+                error_msg = (
+                    f"SMTP connection to {self.config.name} failed before the message "
+                    f"was transmitted: {e}"
+                )
+                logger.error(error_msg)
+                return {"success": False, "message": error_msg, "delivery_state": "failed"}
             error_msg = f"SMTP result is ambiguous via {self.config.name}: {e}"
             logger.error(error_msg)
-            self.disconnect()
             return {"success": False, "message": error_msg, "delivery_state": "unknown"}
         except Exception as e:
             error_msg = f"Failed to send email via {self.config.name}: {e}"
