@@ -2,6 +2,24 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.2.1 — 2026-09-23
+
+### Sending reliability
+
+- Check a pooled SMTP connection is still open before reusing it. Providers hang
+  up on idle connections, so the first send after a quiet spell was written into
+  a socket the server had already closed and came back as an ambiguous result.
+  A stale connection is now replaced and the send proceeds.
+- Report a send that demonstrably never left as failed rather than unknown. Only
+  a failure from the point the message content goes on the wire is ambiguous; one
+  from the greeting, MAIL FROM or RCPT TO is not, and reporting it as ambiguous
+  cost the caller their upload slot for a message that was never transmitted.
+  A connection this server did not build still reports no evidence, and no
+  evidence is still read as ambiguous.
+- Make the SMTP timeouts configurable and separate connecting from commands. One
+  hardcoded 10 s governed both, so a large attachment on a slow link could time
+  out mid-transfer and be recorded as an unknown outcome.
+
 ## v0.2.0 — 2026-09-22
 
 ### Outbound attachments
