@@ -11,12 +11,15 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from src.config import settings
 from src.database.connection import get_db_session
 from src.email.draft_builder import OutboundPart, plan_outbound_parts
 from src.models.smtp_config import SMTPConfig
+
+if TYPE_CHECKING:
+    from src.email.graph_sender import GraphMailSender
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +87,152 @@ def _transmission_provably_not_started(server) -> bool:
     return getattr(server, "message_data_started", None) is False
 
 
+class OutboundCompositionError(Exception):
+    """A part could not be turned into MIME; nothing was built that could be sent."""
+
+
+def _build_part(part: OutboundPart, *, inline: bool) -> MIMEBase:
+    """Render one already-validated part.
+
+    Every value here has been through ``plan_outbound_parts``: the type is
+    two safe tokens, the Content-ID is a bare token we bracket ourselves,
+    and the filename came out of ``sanitize_filename``. Nothing a caller
+    supplied is interpolated into a header as-is.
+    """
+    mime_part = MIMEBase(part.maintype, part.subtype)
+    mime_part.set_payload(part.data)
+    encoders.encode_base64(mime_part)
+    if inline:
+        # Content-ID is what a cid: URL resolves against; the inline
+        # disposition is what clients that ignore Content-ID look at.
+        # Real clients emit both, so both are sent.
+        mime_part.add_header("Content-ID", f"<{part.content_id}>")
+    mime_part.add_header(
+        "Content-Disposition",
+        "inline" if inline else "attachment",
+        filename=part.filename,
+    )
+    return mime_part
+
+
+def compose_outbound_message(
+    config,
+    *,
+    to_addresses: List[str],
+    subject: str,
+    body_text: Optional[str] = None,
+    body_html: Optional[str] = None,
+    cc_addresses: Optional[List[str]] = None,
+    attachments: Optional[List[Dict]] = None,
+    reply_to: Optional[str] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+) -> MIMEBase:
+    """Build the message every transport sends, so none of them can drift.
+
+    Kept apart from the SMTP conversation because there is more than one way to
+    hand a message to a provider -- SMTP for most mailboxes, Microsoft Graph for
+    Exchange Online -- and a message composed for one must be the message the
+    other delivers. Bcc is deliberately not a header here: SMTP carries it in the
+    envelope, and a transport that must carry it in the message adds it itself.
+
+    Raises OutboundCompositionError when an attachment cannot be rendered. The
+    caller turns that into a definite non-send.
+    """
+    # Decide the structure before building anything: whether a related
+    # level is needed depends on which parts the HTML actually uses.
+    try:
+        inline_parts, attachment_parts = plan_outbound_parts(attachments, body_html)
+    except Exception as e:
+        logger.error("Error planning outbound attachments: %s", e)
+        raise OutboundCompositionError from e
+
+    # Create body container
+    body_container = MIMEMultipart("alternative")
+
+    # Add text body
+    if body_text:
+        text_part = MIMEText(body_text, "plain", "utf-8")
+        body_container.attach(text_part)
+
+    # Add HTML body
+    if body_html:
+        html_part = MIMEText(body_html, "html", "utf-8")
+        body_container.attach(html_part)
+
+    # If no body provided, add default
+    if not body_text and not body_html:
+        text_part = MIMEText("", "plain", "utf-8")
+        body_container.attach(text_part)
+
+    rendered_inline = []
+    rendered_attachments = []
+    for part, is_inline in [(p, True) for p in inline_parts] + [(p, False) for p in attachment_parts]:
+        try:
+            (rendered_inline if is_inline else rendered_attachments).append(
+                _build_part(part, inline=is_inline)
+            )
+            logger.debug("Added %s part: %s", "inline" if is_inline else "attachment", part.filename)
+        except Exception as e:
+            logger.error("Error adding attachment %s: %s", part.filename, e)
+            raise OutboundCompositionError from e
+
+    if rendered_inline:
+        # The body and the parts its cid: URLs point at have to share a
+        # multipart/related, or the references cannot resolve.
+        #
+        # type= is RFC 2387's required parameter naming the root part --
+        # the one a client should render and resolve the cid: URLs
+        # against. Apple Mail and Outlook both emit it; modern clients
+        # tolerate its absence, but matching real-client output exactly
+        # is the point. body_container is always the first child, so
+        # the declared type is read off it rather than hardcoded.
+        related = MIMEMultipart("related", type=body_container.get_content_type())
+        related.attach(body_container)
+        for part in rendered_inline:
+            related.attach(part)
+        root = related
+    else:
+        root = body_container
+
+    if rendered_attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(root)
+        for part in rendered_attachments:
+            msg.attach(part)
+    elif rendered_inline:
+        # No ordinary attachments: a mixed level with one child buys
+        # nothing, so the related container is the message.
+        msg = root
+    else:
+        # Unchanged from before inline parts existed: a mixed wrapper
+        # around the alternative body, which is what already ships.
+        msg = MIMEMultipart("mixed")
+        msg.attach(body_container)
+
+    # Set headers - use account_name if available, otherwise username
+    from_email = getattr(config, "account_name", config.username)
+    if not from_email or "@" not in from_email:
+        from_email = config.username  # fallback
+    msg["From"] = from_email
+    msg["To"] = ", ".join(to_addresses)
+    msg["Subject"] = subject
+    msg["Date"] = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    msg["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
+
+    if cc_addresses:
+        msg["Cc"] = ", ".join(cc_addresses)
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+
+    return msg
+
+
+
 class EmailSender:
     """SMTP client for sending emails."""
 
@@ -123,9 +272,9 @@ class EmailSender:
 
             # Login
             if getattr(self.config, "auth_type", "password") == "oauth2":
-                from src.security.provider_tokens import refresh_access_token
+                from src.security.provider_tokens import access_token_for
 
-                token = refresh_access_token(self.config.credential_ciphertext)
+                token = access_token_for(self.config, "smtp")
                 auth = f"user={self.config.username}\x01auth=Bearer {token}\x01\x01"
                 encoded = base64.b64encode(auth.encode()).decode()
                 code, response = self._server.docmd("AUTH", f"XOAUTH2 {encoded}")
@@ -167,30 +316,6 @@ class EmailSender:
                 logger.error("Error disconnecting from SMTP server %s: %s", self.config.name, e)
             finally:
                 self._server = None
-
-    @staticmethod
-    def _build_part(part: OutboundPart, *, inline: bool) -> MIMEBase:
-        """Render one already-validated part.
-
-        Every value here has been through ``plan_outbound_parts``: the type is
-        two safe tokens, the Content-ID is a bare token we bracket ourselves,
-        and the filename came out of ``sanitize_filename``. Nothing a caller
-        supplied is interpolated into a header as-is.
-        """
-        mime_part = MIMEBase(part.maintype, part.subtype)
-        mime_part.set_payload(part.data)
-        encoders.encode_base64(mime_part)
-        if inline:
-            # Content-ID is what a cid: URL resolves against; the inline
-            # disposition is what clients that ignore Content-ID look at.
-            # Real clients emit both, so both are sent.
-            mime_part.add_header("Content-ID", f"<{part.content_id}>")
-        mime_part.add_header(
-            "Content-Disposition",
-            "inline" if inline else "attachment",
-            filename=part.filename,
-        )
-        return mime_part
 
     async def _ensure_live_connection(self) -> bool:
         """Reconnect when the cached connection is gone. Never raises.
@@ -286,103 +411,25 @@ class EmailSender:
             return {"success": False, "message": "Failed to connect to SMTP server"}
 
         try:
-            # Decide the structure before building anything: whether a related
-            # level is needed depends on which parts the HTML actually uses.
             try:
-                inline_parts, attachment_parts = plan_outbound_parts(attachments, body_html)
-            except Exception as e:
-                logger.error("Error planning outbound attachments: %s", e)
+                msg = compose_outbound_message(
+                    self.config,
+                    to_addresses=to_addresses,
+                    subject=subject,
+                    body_text=body_text,
+                    body_html=body_html,
+                    cc_addresses=cc_addresses,
+                    attachments=attachments,
+                    reply_to=reply_to,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                )
+            except OutboundCompositionError:
                 return {
                     "success": False,
                     "message": "Failed to construct an outbound attachment",
                     "delivery_state": "failed",
                 }
-
-            # Create body container
-            body_container = MIMEMultipart("alternative")
-
-            # Add text body
-            if body_text:
-                text_part = MIMEText(body_text, "plain", "utf-8")
-                body_container.attach(text_part)
-
-            # Add HTML body
-            if body_html:
-                html_part = MIMEText(body_html, "html", "utf-8")
-                body_container.attach(html_part)
-
-            # If no body provided, add default
-            if not body_text and not body_html:
-                text_part = MIMEText("", "plain", "utf-8")
-                body_container.attach(text_part)
-
-            rendered_inline = []
-            rendered_attachments = []
-            for part, is_inline in [(p, True) for p in inline_parts] + [(p, False) for p in attachment_parts]:
-                try:
-                    (rendered_inline if is_inline else rendered_attachments).append(
-                        self._build_part(part, inline=is_inline)
-                    )
-                    logger.debug("Added %s part: %s", "inline" if is_inline else "attachment", part.filename)
-                except Exception as e:
-                    logger.error("Error adding attachment %s: %s", part.filename, e)
-                    return {
-                        "success": False,
-                        "message": "Failed to construct an outbound attachment",
-                        "delivery_state": "failed",
-                    }
-
-            if rendered_inline:
-                # The body and the parts its cid: URLs point at have to share a
-                # multipart/related, or the references cannot resolve.
-                #
-                # type= is RFC 2387's required parameter naming the root part --
-                # the one a client should render and resolve the cid: URLs
-                # against. Apple Mail and Outlook both emit it; modern clients
-                # tolerate its absence, but matching real-client output exactly
-                # is the point. body_container is always the first child, so
-                # the declared type is read off it rather than hardcoded.
-                related = MIMEMultipart("related", type=body_container.get_content_type())
-                related.attach(body_container)
-                for part in rendered_inline:
-                    related.attach(part)
-                root = related
-            else:
-                root = body_container
-
-            if rendered_attachments:
-                msg = MIMEMultipart("mixed")
-                msg.attach(root)
-                for part in rendered_attachments:
-                    msg.attach(part)
-            elif rendered_inline:
-                # No ordinary attachments: a mixed level with one child buys
-                # nothing, so the related container is the message.
-                msg = root
-            else:
-                # Unchanged from before inline parts existed: a mixed wrapper
-                # around the alternative body, which is what already ships.
-                msg = MIMEMultipart("mixed")
-                msg.attach(body_container)
-
-            # Set headers - use account_name if available, otherwise username
-            from_email = getattr(self.config, "account_name", self.config.username)
-            if not from_email or "@" not in from_email:
-                from_email = self.config.username  # fallback
-            msg["From"] = from_email
-            msg["To"] = ", ".join(to_addresses)
-            msg["Subject"] = subject
-            msg["Date"] = datetime.now(tz=timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
-            msg["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
-
-            if cc_addresses:
-                msg["Cc"] = ", ".join(cc_addresses)
-            if reply_to:
-                msg["Reply-To"] = reply_to
-            if in_reply_to:
-                msg["In-Reply-To"] = in_reply_to
-            if references:
-                msg["References"] = references
 
             # Collect all recipients
             all_recipients = to_addresses[:]
@@ -517,12 +564,23 @@ class EmailSenderManager:
     def __init__(self):
         self._senders = {}
 
-    async def get_sender(self, smtp_config: SMTPConfig) -> EmailSender:
+    async def get_sender(self, smtp_config: SMTPConfig) -> "EmailSender | GraphMailSender":
         """Get or create email sender for config."""
+        # Imported here because the Graph sender builds on this module's composer.
+        from src.email.graph_sender import GraphMailSender, uses_graph
+
         sender_key = smtp_config.id
+        sender_class = GraphMailSender if uses_graph(smtp_config) else EmailSender
+
+        existing = self._senders.get(sender_key)
+        if existing is not None and type(existing) is not sender_class:
+            # The account moved to another transport; the old sender's connection
+            # is of no use to the new one.
+            existing.disconnect()
+            del self._senders[sender_key]
 
         if sender_key not in self._senders:
-            self._senders[sender_key] = EmailSender(smtp_config)
+            self._senders[sender_key] = sender_class(smtp_config)
         else:
             sender = self._senders[sender_key]
             old_connection = (
