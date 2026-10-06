@@ -43,6 +43,8 @@ class SMTPClient:
         self.client = None
         self._connected = False
         self._connection_error: Exception | None = None
+        # Set once a server has refused SEARCH with an explicit charset; see search().
+        self._ascii_search = False
         cursors = getattr(smtp_config, "sync_cursors", {}) or {}
         self._last_uids: Dict[str, int] = {
             folder: state["last_uid"] for folder, state in cursors.items() if state.get("last_uid") is not None
@@ -127,12 +129,12 @@ class SMTPClient:
                     await self.client.starttls(ssl_context=ssl_context)
 
                 if getattr(self.config, "auth_type", "password") == "oauth2":
-                    from src.security.provider_tokens import refresh_access_token
+                    from src.security.provider_tokens import access_token_for
 
-                    access_token = await asyncio.to_thread(
-                        refresh_access_token, self.config.credential_ciphertext
-                    )
-                    login_response = await self.client.xoauth2(self.config.username, access_token.encode())
+                    access_token = await asyncio.to_thread(access_token_for, self.config, "imap")
+                    # A str, whatever the wrapper's annotation says: the protocol interpolates it
+                    # into the SASL string, and bytes would put "b'...'" in the bearer token.
+                    login_response = await self.client.xoauth2(self.config.username, access_token)
                 else:
                     login_response = await self.client.login(self.config.username, self.config.password)
 
@@ -156,6 +158,43 @@ class SMTPClient:
             logger.error("Connection failed for %s: %s", self.config.name, type(e).__name__)
             await self.disconnect()
             return False
+
+    async def search(self, *criteria: str):
+        """IMAP SEARCH, with whichever charset the server will accept.
+
+        aioimaplib sends ``CHARSET utf-8`` unless told otherwise, and Exchange
+        Online answers that with ``NO [BADCHARSET (US-ASCII)]`` -- so every
+        folder looked unsearchable, and nothing synchronised. Every criterion
+        used here is ASCII, where leaving the charset out is equally correct and
+        accepted everywhere, so on that one refusal the search is repeated
+        without it and the server is remembered. Servers that take utf-8 are
+        never asked differently.
+        """
+        if not self._ascii_search:
+            response = await self.client.search(*criteria)
+            refused = response.result == "NO" and any(
+                b"BADCHARSET" in bytes(line).upper() for line in response.lines if isinstance(line, (bytes, bytearray))
+            )
+            if not refused:
+                return response
+            self._ascii_search = True
+            logger.info("%s does not accept a SEARCH charset; searching without one", self.config.name)
+        return await self.client.search(*criteria, charset=None)
+
+    def _connect_error(self) -> ConnectionError:
+        """The error for a failed connect, saying why when the owner can act on it.
+
+        Most connection failures are the network's and say nothing useful. A
+        refused sign-in is different: it is the one case where the account has
+        to be connected again, and the sync status is where the owner will look
+        for that. The text also carries the word the failure classifier keys on,
+        so it is filed as an authentication failure rather than a generic one.
+        """
+        from src.security.provider_tokens import ProviderAuthError, ProviderNotConfigured
+
+        cause = self._connection_error
+        detail = f": {cause}" if isinstance(cause, (ProviderAuthError, ProviderNotConfigured)) else ""
+        return ConnectionError(f"Could not connect to {self.config.name}{detail}")
 
     async def disconnect(self):
         """Disconnect from the IMAP server."""
@@ -194,7 +233,7 @@ class SMTPClient:
             List[Dict]: A batch of parsed email dicts.
         """
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
+            raise self._connect_error() from self._connection_error
 
         try:
             folders = await self._get_folders()
@@ -254,6 +293,10 @@ class SMTPClient:
 
         if not folders:
             folders = ["INBOX"]
+
+        from src.email.exchange_folders import exclude_non_mail_folders
+
+        folders = exclude_non_mail_folders(self.config, folders) or ["INBOX"]
 
         # For Gmail, sync All Mail which contains everything in one folder
         if "gmail.com" in self.config.host.lower():
@@ -355,9 +398,9 @@ class SMTPClient:
             search_criteria = ("ALL",)
 
         if last_uid is not None:
-            search_response = await self.client.search("UID", f"{last_uid + 1}:*")
+            search_response = await self.search("UID", f"{last_uid + 1}:*")
         else:
-            search_response = await self.client.search(*search_criteria)
+            search_response = await self.search(*search_criteria)
         if search_response.result != "OK":
             raise RuntimeError(f"Search failed in folder {folder} for {self.config.name}")
 
@@ -673,7 +716,7 @@ class SMTPClient:
     async def fetch_raw_email(self, folder: str, uid: int, uid_validity: int | None = None) -> bytes:
         """Refetch one original RFC822 message without retaining its binary."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
+            raise self._connect_error() from self._connection_error
         selected = await self.client.select(f'"{folder}"')
         if selected.result != "OK":
             raise RuntimeError(f"Cannot select folder {folder}")
@@ -688,13 +731,13 @@ class SMTPClient:
     async def fetch_raw_by_message_id(self, message_id: str) -> bytes:
         """Resolve a legacy record that predates persisted UID provenance."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
+            raise self._connect_error() from self._connection_error
         safe_message_id = message_id.replace('"', "")
         for folder in await self._get_folders():
             selected = await self.client.select(f'"{folder}"')
             if selected.result != "OK":
                 continue
-            response = await self.client.search("HEADER", "Message-ID", f'"{safe_message_id}"')
+            response = await self.search("HEADER", "Message-ID", f'"{safe_message_id}"')
             if response.result != "OK" or not response.lines:
                 continue
             sequence_ids = response.lines[0].decode("ascii", errors="ignore").split()
@@ -708,7 +751,7 @@ class SMTPClient:
     async def fetch_folder_state(self) -> dict[str, dict]:
         """Fetch UID and flag state only, for deletion/read-state reconciliation."""
         if not await self._ensure_connected():
-            raise ConnectionError(f"Could not connect to {self.config.name}") from self._connection_error
+            raise self._connect_error() from self._connection_error
         snapshots = {}
         for folder in await self._get_folders():
             selected = await self.client.select(f'"{folder}"')
@@ -717,7 +760,7 @@ class SMTPClient:
             uid_validity = self._extract_uid_validity(selected.lines)
             uids = set()
             flags = {}
-            search = await self.client.search("ALL")
+            search = await self.search("ALL")
             if search.result != "OK":
                 raise RuntimeError(f"Failed to list messages while reconciling {folder}")
             # Every data line, not just the first: a large SEARCH response is split
