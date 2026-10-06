@@ -2,6 +2,68 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.3.0 — 2026-10-06
+
+### Microsoft 365 / Exchange Online
+
+- Connect Microsoft 365 mailboxes with Microsoft's own sign-in, the way Gmail is
+  connected. `begin_microsoft_connection` returns a signed link, the owner picks
+  the account and approves, and the page that follows says whether the mailbox is
+  usable. Exchange Online accepts no password or app password over IMAP, so there
+  is no password route for these mailboxes. Setup is one Entra app registration;
+  the README walks through it.
+- Read, search, flag, move, delete, draft and manage folders over IMAP with an
+  OAuth token (XOAUTH2). Nothing about the sync machinery changed: a Microsoft
+  account is an IMAP account whose password is a short-lived token.
+- Send through Microsoft Graph instead of SMTP AUTH. Exchange Online ships with
+  SMTP AUTH switched off for the whole organisation, and enabling it is a
+  decision for that organisation's administrator, which a connector should not
+  have to ask for. Graph needs only the user's own consent. The message is the
+  MIME the SMTP sender builds -- composition now lives in one function both
+  transports share, so the two cannot drift -- and a send is classified the way
+  SMTP's is: a refusal or a failure to connect
+  is a definite non-send, anything after the request left is unknown and is never
+  retried, because a second request could deliver the message twice.
+- Store only the refresh token (and tenant) per mailbox. The app registration's
+  secret stays in the server's environment, so it can be renewed without
+  connecting any mailbox again, and a token Microsoft has revoked is reported as
+  an authentication failure that names the remedy.
+- Check the connection at the moment it is made. A mailbox with IMAP switched
+  off, or a grant without permission to send, is saved but flagged on the page the
+  owner is already looking at rather than left to fail quietly.
+- Leave out the folders that are not mail. Exchange lists the calendar, contacts,
+  tasks, notes and journal over IMAP as if they were folders of messages, and
+  indexing them filled search with calendar entries. They are recognised by the
+  mailbox's own language (English, German, French, Spanish, Italian, Dutch,
+  Portuguese) and only when a language's whole set of defaults is present, so a
+  folder a user named "Agenda" is not mistaken for one. An unrecognised language
+  is indexed in full, with a warning; `EMAILSERVER_EXCLUDED_SYNC_FOLDERS` names
+  the folders to skip.
+- Scope an account-connection link to its provider. All signed links share one
+  key, so a link minted for Gmail could otherwise start a Microsoft consent flow.
+
+### Fixes found by connecting a real mailbox
+
+- Repeat a refused `SEARCH` without a charset. aioimaplib sends `CHARSET utf-8`;
+  Exchange answers `NO [BADCHARSET (US-ASCII)]`, so every folder looked
+  unsearchable and nothing synchronised. A server that takes the charset is never
+  asked differently.
+- Pass the XOAUTH2 token to aioimaplib as text. Its annotation says bytes, but it
+  puts the value into an f-string and calls `.encode()` on it for logging, so
+  bytes both corrupted the bearer token and crashed. The OAuth IMAP path had never
+  run before, because Gmail OAuth accounts use the Gmail API.
+- Find an attachment again by its checksum when the recorded position names a
+  different part. One message can be filed in several folders, and Exchange keeps
+  the sender's MIME in Sent Items but rebuilds the copy it delivers, dropping the
+  text alternative and renumbering every part after it; mail a user sends to
+  themselves therefore had attachments that could not be downloaded.
+
+### Build
+
+- Keep SQLAlchemy below 2.1. A clean install resolved 2.1.3, where a bare
+  `postgresql://` URL means psycopg 3 while the image ships psycopg2, so the image
+  built from this tag would not have started.
+
 ## v0.2.1 — 2026-09-23
 
 ### Sending reliability

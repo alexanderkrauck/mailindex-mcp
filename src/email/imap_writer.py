@@ -235,7 +235,12 @@ async def list_folders(client) -> list[dict]:
             continue
         role = next((flag.lstrip("\\") for flag in flags if flag in SPECIAL_USE), None)
         folders.append({"name": name, "special_use": role})
-    return folders
+    # The same folders the synchronizer indexes: offering a calendar as a place
+    # to move mail to would only be a way to lose it.
+    from src.email.exchange_folders import exclude_non_mail_folders
+
+    kept = set(exclude_non_mail_folders(getattr(client, "config", None), [f["name"] for f in folders]))
+    return [folder for folder in folders if folder["name"] in kept]
 
 
 async def folder_message_count(client, name: str) -> int:
@@ -243,7 +248,7 @@ async def folder_message_count(client, name: str) -> int:
     selected = await client.client.select(f'"{name}"')
     if selected.result != "OK":
         raise ImapWriteError(f"cannot select {name}")
-    search = await client.client.search("ALL")
+    search = await client.search("ALL")
     if search.result != "OK":
         raise ImapWriteError(f"cannot count messages in {name}")
     return len(

@@ -16,6 +16,7 @@ async def test_mcp_tool_surface_is_narrow_and_annotated():
         "update_mail_account",
         "begin_mail_account_password_setup",
         "begin_gmail_connection",
+        "begin_microsoft_connection",
         "search_mail",
         "search_mail_regex",
         "get_mail",

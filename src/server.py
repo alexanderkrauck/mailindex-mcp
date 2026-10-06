@@ -269,8 +269,8 @@ final_app.mount("/api/v1", api_app)
 
 
 @final_app.get("/")
-async def root(connected: str | None = None):
-    return service_page(connected)
+async def root(connected: str | None = None, problem: str | None = None):
+    return service_page(connected, problem)
 
 
 # The MCP ASGI app owns /mcp and root-level OAuth discovery/callback routes.

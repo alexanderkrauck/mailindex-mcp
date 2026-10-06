@@ -50,6 +50,11 @@ class Settings(BaseSettings):
         "deleted messages",
         "papierkorb",
     ]
+    # Top-level folders (and everything beneath them) that are never synced, on
+    # any account, matched without regard to case. Exchange mailboxes already
+    # skip their calendar, contacts and tasks; this is for the languages that
+    # recognition does not know, and for anything else you would rather not index.
+    excluded_sync_folders: list[str] = []
     gmail_page_size: int = 100
     gmail_backfill_pages_per_cycle: int = 5
     gmail_history_pages_per_cycle: int = 20
@@ -121,6 +126,15 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8002"
     google_client_id: str = ""
     google_client_secret: str = ""
+    # Microsoft 365, Exchange Online and Outlook.com mailboxes are connected by
+    # OAuth against an Entra app registration of your own: a Web platform app
+    # whose redirect URI is <public_base_url>/api/v1/accounts/microsoft/callback.
+    # The secret is optional only for a registration configured as a public
+    # client. "common" signs in work, school and personal accounts; a tenant ID,
+    # "organizations" or "consumers" narrows who may connect a mailbox.
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_tenant: str = "common"
     google_required_scopes: list[str] = [
         "openid",
         "https://www.googleapis.com/auth/userinfo.email",

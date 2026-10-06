@@ -60,19 +60,22 @@ def _verify(token: str) -> dict:
         raise ValueError("Invalid or expired account connection token") from exc
 
 
-def issue_account_connect_token(user_id: int) -> str:
+def issue_account_connect_token(user_id: int, provider: str = "gmail") -> str:
+    # The provider is part of the purpose, not just a parameter of the route: all
+    # signed grants share one key, so a link minted to start one provider's
+    # consent flow must not be spendable on another's.
     return _issue(
         {
-            "purpose": "gmail-account-connect",
+            "purpose": f"{provider}-account-connect",
             "user_id": user_id,
             "expires_at": int(time.time()) + settings.account_connect_token_ttl_seconds,
         }
     )
 
 
-def verify_account_connect_token(token: str) -> int:
+def verify_account_connect_token(token: str, provider: str = "gmail") -> int:
     claims = _verify(token)
-    if claims.get("purpose") != "gmail-account-connect":
+    if claims.get("purpose") != f"{provider}-account-connect":
         raise ValueError("Invalid or expired account connection token")
     return int(claims["user_id"])
 

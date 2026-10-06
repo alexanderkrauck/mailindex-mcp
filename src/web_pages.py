@@ -182,13 +182,54 @@ def html_page(content: str, status_code: int = 200) -> HTMLResponse:
     )
 
 
-def service_page(connected: str | None = None) -> HTMLResponse:
+# What a connection that did not fully work needs from its owner. Chosen by a
+# fixed key from the query string, never echoed from it.
+MICROSOFT_PROBLEMS = {
+    "imap": (
+        "Microsoft accepted your sign-in, but the mailbox refused an IMAP connection, so nothing can be "
+        "synchronized yet. IMAP is probably switched off for this mailbox; a Microsoft 365 administrator can "
+        "allow it with Set-CASMailbox -Identity <address> -ImapEnabled $true."
+    ),
+    "send": (
+        "Reading mail will work, but sending will not: Microsoft did not give this connection permission to "
+        "send mail. Connect the mailbox again and accept every permission that is requested."
+    ),
+    "both": (
+        "Microsoft accepted your sign-in, but neither reading nor sending works yet. IMAP may be switched off "
+        "for this mailbox (an administrator can allow it with Set-CASMailbox -Identity <address> "
+        "-ImapEnabled $true), and sending needs the mail permissions to be accepted. Connect the mailbox "
+        "again once that is sorted out."
+    ),
+}
+
+
+def service_page(connected: str | None = None, problem: str | None = None) -> HTMLResponse:
     if connected == "gmail":
         return html_page(
             _document(
                 title="Gmail connected",
                 eyebrow="Connected",
                 heading="Gmail is ready",
+                body="Initial synchronization has started. You can close this tab and return to the conversation.",
+                tone="success",
+            )
+        )
+    if connected == "microsoft":
+        if problem in MICROSOFT_PROBLEMS:
+            return html_page(
+                _document(
+                    title="Microsoft connected with a problem",
+                    eyebrow="Needs attention",
+                    heading="Microsoft 365 is connected, but not working yet",
+                    body=MICROSOFT_PROBLEMS[problem],
+                    tone="warning",
+                )
+            )
+        return html_page(
+            _document(
+                title="Microsoft connected",
+                eyebrow="Connected",
+                heading="Microsoft 365 is ready",
                 body="Initial synchronization has started. You can close this tab and return to the conversation.",
                 tone="success",
             )
@@ -255,4 +296,33 @@ def invalid_setup_page() -> HTMLResponse:
             tone="danger",
         ),
         status_code=401,
+    )
+
+
+# AADSTS codes that mean "an administrator has to approve this app first", as
+# opposed to the user having said no.
+_ADMIN_APPROVAL_CODES = ("AADSTS65001", "AADSTS90094", "AADSTS650056", "AADSTS700016")
+
+
+def microsoft_denied_page(error: str, description: str) -> HTMLResponse:
+    """The consent screen ended without a code: declined, blocked, or needing an administrator."""
+    needs_admin = any(code in description for code in _ADMIN_APPROVAL_CODES)
+    if needs_admin:
+        body = (
+            "Your organization requires an administrator to approve this app before it can be used. "
+            "Ask them to grant consent for it, then start the connection again."
+        )
+    elif error == "access_denied":
+        body = "The request was declined, so nothing was connected. Start the connection again to retry."
+    else:
+        body = f"Microsoft reported: {' '.join(description.split())[:300] or error}"
+    return html_page(
+        _document(
+            title="Microsoft did not connect",
+            eyebrow="Not connected",
+            heading="The mailbox was not connected",
+            body=body,
+            tone="danger",
+        ),
+        status_code=400,
     )

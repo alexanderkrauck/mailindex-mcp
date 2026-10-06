@@ -23,6 +23,7 @@ from src.security.account_connect_tokens import (
 from src.security.auth import current_mcp_user
 from src.security.download_tokens import issue_download_token
 from src.security.mcp_errors import mcp_error_boundary
+from src.security.provider_tokens import microsoft_configured
 from src.security.upload_tokens import issue_upload_token
 from src.services.attachment_service import (
     owned_attachment,
@@ -152,7 +153,9 @@ def register_mcp_tools(mcp) -> None:
             "it unprompted, or explicitly asks to do it that way.\n\n"
             "Use an app password from the provider's security settings, never an "
             "account login password. For Gmail prefer begin_gmail_connection, "
-            "which uses OAuth and the Gmail API. Configuration is retained when a "
+            "which uses OAuth and the Gmail API. Microsoft 365, Exchange Online "
+            "and Outlook.com mailboxes cannot use a password at all: use "
+            "begin_microsoft_connection. Configuration is retained when a "
             "connection test fails, so settings can be corrected without "
             "re-entering the credential."
         ),
@@ -305,6 +308,42 @@ def register_mcp_tools(mcp) -> None:
             "connect_url": (
                 f"{settings.public_base_url.rstrip('/')}"
                 f"/api/v1/accounts/gmail/connect/mcp?token={token}"
+            ),
+            "expires_in": settings.account_connect_token_ttl_seconds,
+        }
+
+    @mcp.tool(
+        name="begin_microsoft_connection",
+        description=(
+            "Create a short-lived signed URL for connecting a Microsoft 365, "
+            "Exchange Online or Outlook.com mailbox with Microsoft OAuth. Open the "
+            "returned URL, choose the Microsoft account and accept the permissions. "
+            "This is the only way to connect such a mailbox: Microsoft no longer "
+            "accepts a password or app password for them, so add_mail_account "
+            "cannot. The page that follows says at once if the mailbox could not be "
+            "used, for example because IMAP is switched off for it."
+        ),
+        annotations=WRITE_EXTERNAL,
+    )
+    @mcp_error_boundary
+    async def begin_microsoft_connection() -> dict:
+        user = await current_mcp_user()
+        if not microsoft_configured():
+            # Said here rather than discovered after the user has opened a link
+            # that can only answer with an error page.
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "This server has no Microsoft app registration, so Microsoft mailboxes cannot be "
+                    "connected. The operator needs to set EMAILSERVER_MICROSOFT_CLIENT_ID and "
+                    "EMAILSERVER_MICROSOFT_CLIENT_SECRET (see the README)."
+                ),
+            )
+        token = issue_account_connect_token(user.id, provider="microsoft")
+        return {
+            "connect_url": (
+                f"{settings.public_base_url.rstrip('/')}"
+                f"/api/v1/accounts/microsoft/connect/mcp?token={token}"
             ),
             "expires_in": settings.account_connect_token_ttl_seconds,
         }
