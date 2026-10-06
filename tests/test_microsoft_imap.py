@@ -15,12 +15,12 @@ from src.security.provider_tokens import ProviderAuthError
 def microsoft_imap_config(**overrides):
     values = {
         "id": 11,
-        "name": "progress.works",
+        "name": "contoso.com",
         "provider": "microsoft",
         "auth_type": "oauth2",
         "host": "outlook.office365.com",
         "port": 993,
-        "username": "owner@progress.works",
+        "username": "owner@contoso.com",
         "credential_ciphertext": "enc:v1:unused",
         "imap_use_ssl": True,
         "imap_use_tls": False,
@@ -49,7 +49,7 @@ async def test_imap_sign_in_uses_the_exchange_token_over_xoauth2(monkeypatch):
     # The IMAP token and the sending token are different resources; asking for
     # the wrong one fails at the server with an opaque authentication error.
     assert purposes == ["imap"]
-    imap.xoauth2.assert_awaited_once_with("owner@progress.works", "exchange-access-token")
+    imap.xoauth2.assert_awaited_once_with("owner@contoso.com", "exchange-access-token")
     imap.login.assert_not_called()
 
 
@@ -76,7 +76,7 @@ async def test_a_revoked_sign_in_is_reported_as_an_authentication_failure_with_t
     # The mailbox needs the owner, not a retry: that is what the status must say.
     assert code == "ACCOUNT_AUTH_FAILED"
     assert "begin_microsoft_connection" in message
-    assert "progress.works" in message
+    assert "contoso.com" in message
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test_an_ordinary_connection_failure_does_not_pretend_to_know_why(monke
 
     # An outage is retried by the scheduler; sending the owner to reconnect
     # would be wrong, so only a refused sign-in gets the extra text.
-    assert str(raised.value) == "Could not connect to progress.works"
+    assert str(raised.value) == "Could not connect to contoso.com"
 
 
 @asynccontextmanager
@@ -186,7 +186,7 @@ async def test_the_sasl_string_on_the_wire_carries_the_bare_token(plaintext_loop
             await client.disconnect()
 
     assert seen["mechanism"] == b"XOAUTH2"
-    assert seen["sasl"] == b"user=owner@progress.works\x01auth=Bearer the-exchange-token\x01\x01"
+    assert seen["sasl"] == b"user=owner@contoso.com\x01auth=Bearer the-exchange-token\x01\x01"
 
 
 @pytest.mark.asyncio

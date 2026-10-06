@@ -161,7 +161,7 @@ async def test_the_synchronizer_never_visits_non_mail_folders():
     from src.email.smtp_client import SMTPClient
 
     client = SMTPClient(
-        SimpleNamespace(id=11, name="progress.works", provider="microsoft", host="outlook.office365.com")
+        SimpleNamespace(id=11, name="contoso.com", provider="microsoft", host="outlook.office365.com")
     )
     client.client = AsyncMock()
     client.client.list.return_value = listing(ENGLISH_MAILBOX)
@@ -175,7 +175,7 @@ async def test_a_calendar_is_not_offered_as_somewhere_to_move_mail():
     from src.email.smtp_client import SMTPClient
 
     client = SMTPClient(
-        SimpleNamespace(id=11, name="progress.works", provider="microsoft", host="outlook.office365.com")
+        SimpleNamespace(id=11, name="contoso.com", provider="microsoft", host="outlook.office365.com")
     )
     client.client = AsyncMock()
     client.client.list.return_value = listing(ENGLISH_MAILBOX)

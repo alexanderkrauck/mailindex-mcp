@@ -17,11 +17,11 @@ from src.services.upload_service import delivery_outcome
 def account(**overrides):
     values = {
         "id": 11,
-        "name": "progress.works",
+        "name": "contoso.com",
         "provider": "microsoft",
         "auth_type": "oauth2",
-        "account_name": "owner@progress.works",
-        "username": "owner@progress.works",
+        "account_name": "owner@contoso.com",
+        "username": "owner@contoso.com",
         "smtp_host": "smtp.office365.com",
         "smtp_port": 587,
         "credential_ciphertext": "enc:v1:unused",
@@ -85,7 +85,7 @@ async def test_the_message_goes_out_as_base64_mime_with_the_bearer_token(tokens)
     # Graph's raw-MIME form: the message itself as base64 text, not a JSON document.
     assert request.headers["content-type"] == "text/plain"
     assert tokens == ["send"]
-    assert graph.sent["From"] == "owner@progress.works"
+    assert graph.sent["From"] == "owner@contoso.com"
     assert graph.sent["To"] == "to@example.com"
     assert graph.sent["Cc"] == "cc@example.com"
     assert graph.sent["Subject"] == "Hello"
@@ -167,7 +167,7 @@ async def test_a_refusal_is_a_definite_non_send_with_microsofts_reason(tokens, s
     graph = Graph(
         httpx.Response(
             status,
-            json={"error": {"code": "ErrorSendAsDenied", "message": "The user may not send as owner@progress.works."}},
+            json={"error": {"code": "ErrorSendAsDenied", "message": "The user may not send as owner@contoso.com."}},
         )
     )
 

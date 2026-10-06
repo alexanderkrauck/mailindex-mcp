@@ -24,8 +24,8 @@ from src.security.account_connect_tokens import (
 )
 from src.security.crypto import decrypt_secret
 
-TENANT = "3301b473-eb5c-408e-aae1-03d7b40ace17"
-CLIENT_ID = "25d41d81-52e9-4c97-ada2-e9bd48d398bc"
+TENANT = "11111111-1111-1111-1111-111111111111"
+CLIENT_ID = "22222222-2222-2222-2222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -66,8 +66,8 @@ def id_token(**overrides):
         "aud": CLIENT_ID,
         "iss": f"https://login.microsoftonline.com/{TENANT}/v2.0",
         "tid": TENANT,
-        "oid": "67f01f55-2edd-425f-8e6d-60c37b5a1873",
-        "email": "Owner@Progress.Works",
+        "oid": "33333333-3333-3333-3333-333333333333",
+        "email": "Owner@Contoso.com",
         "name": "Owner",
         "exp": int(time.time()) + 3600,
         "nonce": "the-nonce",
@@ -219,10 +219,10 @@ async def test_a_successful_consent_creates_a_ready_to_sync_account(db, owner, m
     account = db.query(SMTPConfig).one()
     assert account.owner_user_id == owner.id
     assert (account.provider, account.auth_type) == ("microsoft", "oauth2")
-    assert account.provider_account_id == f"{TENANT}:67f01f55-2edd-425f-8e6d-60c37b5a1873"
+    assert account.provider_account_id == f"{TENANT}:33333333-3333-3333-3333-333333333333"
     # The address is lower-cased: it becomes the IMAP login and the From header.
-    assert account.account_name == account.username == "owner@progress.works"
-    assert account.name == "Microsoft - owner@progress.works"
+    assert account.account_name == account.username == "owner@contoso.com"
+    assert account.name == "Microsoft - owner@contoso.com"
     assert (account.host, account.port, account.imap_use_ssl) == ("outlook.office365.com", 993, True)
     assert account.enabled is True
     assert account.sync_state == "pending"
@@ -279,18 +279,18 @@ async def test_connecting_the_same_mailbox_again_refreshes_it_rather_than_duplic
 
 @pytest.mark.asyncio
 async def test_a_different_mailbox_in_the_same_tenant_is_a_different_account(db, owner, microsoft):
-    for oid, email in (("11111111-0000-0000-0000-000000000001", "a@progress.works"),
-                       ("11111111-0000-0000-0000-000000000002", "b@progress.works")):
+    for oid, email in (("11111111-0000-0000-0000-000000000001", "a@contoso.com"),
+                       ("11111111-0000-0000-0000-000000000002", "b@contoso.com")):
         request, _ = start(owner)
         microsoft.tokens["id_token"] = id_token(nonce=request.session["microsoft_oauth_nonce"], oid=oid, email=email)
         await callback(db, request)
 
-    assert sorted(account.account_name for account in db.query(SMTPConfig)) == ["a@progress.works", "b@progress.works"]
+    assert sorted(account.account_name for account in db.query(SMTPConfig)) == ["a@contoso.com", "b@contoso.com"]
 
 
 @pytest.mark.asyncio
 async def test_a_name_already_taken_does_not_fail_the_connection(db, owner, microsoft):
-    db.add(SMTPConfig(owner_user_id=owner.id, name="Microsoft - owner@progress.works", host="x", username="x"))
+    db.add(SMTPConfig(owner_user_id=owner.id, name="Microsoft - owner@contoso.com", host="x", username="x"))
     db.commit()
     request, _ = start(owner)
     microsoft.tokens["id_token"] = id_token(nonce=request.session["microsoft_oauth_nonce"])
@@ -298,7 +298,7 @@ async def test_a_name_already_taken_does_not_fail_the_connection(db, owner, micr
     await callback(db, request)
 
     names = sorted(account.name for account in db.query(SMTPConfig))
-    assert len(names) == 2 and names[0] == "Microsoft - owner@progress.works"
+    assert len(names) == 2 and names[0] == "Microsoft - owner@contoso.com"
 
 
 @pytest.mark.asyncio
