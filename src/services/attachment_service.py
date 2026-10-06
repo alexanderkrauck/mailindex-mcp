@@ -111,7 +111,21 @@ async def refetch_attachment_bytes(
         raise HTTPException(status_code=422, detail="Provider returned an undecodable attachment")
     digest = hashlib.sha256(payload).hexdigest()
     if attachment.sha256 and attachment.sha256 != digest:
-        raise HTTPException(status_code=409, detail="Provider attachment no longer matches its recorded checksum")
+        # The recorded position names the wrong part. One message can be filed in
+        # several folders, and a provider need not store every copy alike:
+        # Exchange keeps the sender's original MIME in Sent Items but rebuilds the
+        # copy it delivers, dropping the text alternative and renumbering every
+        # part after it. The bytes are what identify an attachment, so look for
+        # them before concluding the provider changed the file.
+        for _, part in candidates:
+            other = part.get_payload(decode=True)
+            if other is not None and hashlib.sha256(other).hexdigest() == attachment.sha256:
+                selected, payload, digest = part, other, attachment.sha256
+                break
+        else:
+            raise HTTPException(
+                status_code=409, detail="Provider attachment no longer matches its recorded checksum"
+            )
     if not attachment.sha256:
         attachment.sha256 = digest
         attachment.detected_content_type = AttachmentHandler._detect_content_type(payload, attachment.filename)
