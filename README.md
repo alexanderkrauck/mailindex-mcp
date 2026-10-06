@@ -4,7 +4,7 @@
 [![image](https://img.shields.io/badge/ghcr.io-mailindex--mcp-blue?logo=docker&logoColor=white)](https://github.com/alexanderkrauck/mailindex-mcp/pkgs/container/mailindex-mcp)
 [![CI](https://github.com/alexanderkrauck/mailindex-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alexanderkrauck/mailindex-mcp/actions/workflows/ci.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-green)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-19%20tools-8A2BE2)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-21%20tools-8A2BE2)](#mcp-tools)
 
 **A mail client for an AI agent. Everything you can do in Thunderbird — search,
 move, mark, delete, draft — over your own index, on your own machine.**
@@ -46,7 +46,7 @@ accounts. One string is blurred: a case number belonging to a real filing.</sub>
 | Transport | Remote HTTP endpoint | Local stdio process on your machine |
 | Setup on the client | Paste a URL | Install a runtime, edit config JSON, store credentials locally |
 | Users | Multi-tenant, every row owner-scoped | Single user |
-| Tool surface | 19 tools, all annotated | Frequently 40+ |
+| Tool surface | 21 tools, all annotated | Frequently 40+ |
 
 **What it costs you, stated up front.** You run PostgreSQL and a container. The
 index is about **28 MB per 1,000 messages** — a 50,000-message archive is roughly
@@ -126,7 +126,10 @@ way that works with clients such as ChatGPT that refuse to transmit secrets.
 
 Use an **app password** from your provider's security settings, never your
 account login password. For Gmail, ask it to start the Gmail OAuth flow instead:
-that uses the Gmail API and survives label changes better.
+that uses the Gmail API and survives label changes better. Microsoft 365 and
+Exchange Online accept no password at all, so ask it to connect a Microsoft
+mailbox: you sign in at Microsoft and approve what the server may do, exactly as
+with Gmail ([setup](#connecting-microsoft-365--exchange-online)).
 
 <details>
 <summary>Or over HTTP, if you prefer a shell</summary>
@@ -251,8 +254,85 @@ separately:
 - **Gmail** — either an app password over IMAP, or the Gmail OAuth flow via
   `begin_gmail_connection`, which uses the Gmail API instead and survives label
   changes better.
+- **Microsoft 365 / Exchange Online** — OAuth only, via `begin_microsoft_connection`.
+  Microsoft accepts neither a password nor an app password for these mailboxes.
+  See [Connecting Microsoft 365](#connecting-microsoft-365--exchange-online).
 - **Everything else** — an app password from the provider's security settings.
   Never your login password.
+
+### Connecting Microsoft 365 / Exchange Online
+
+Microsoft mailboxes are connected the way Gmail is: you sign in at Microsoft and
+approve what this server may do, and the server keeps only the resulting refresh
+token, encrypted. That needs one app registration, made once per server.
+
+**1. Register an app** in the [Microsoft Entra admin center](https://entra.microsoft.com)
+under *App registrations → New registration*:
+
+- *Supported account types*: **Accounts in any organizational directory and
+  personal Microsoft accounts**, so any Microsoft 365 mailbox can connect. If only
+  your own organisation should, choose *this organizational directory only* and set
+  `MICROSOFT_TENANT` to its tenant ID below; `common` is refused for such an app.
+- *Redirect URI*, platform **Web**:
+  `https://mail.example.com/api/v1/accounts/microsoft/callback`
+  (add `http://localhost:8002/api/v1/accounts/microsoft/callback` for a local trial).
+
+**2. Add these delegated permissions** under *API permissions → Add a permission*:
+
+| API | Permission | What it is for |
+|---|---|---|
+| Office 365 Exchange Online (under *APIs my organization uses*) | `IMAP.AccessAsUser.All` | reading, searching, moving and flagging mail over IMAP |
+| Microsoft Graph | `Mail.Send` | sending mail |
+| Microsoft Graph | `User.Read`, `openid`, `profile`, `email`, `offline_access` | knowing which mailbox signed in, and staying signed in |
+
+Whether a user may approve these for themselves is the tenant's *user consent*
+setting. Where it is restricted, the connection page says an administrator has to
+approve the app first; *Grant admin consent* on this page does it for everyone.
+
+**3. Create a client secret** under *Certificates & secrets*. Copy its *Value*
+straight away; Microsoft shows it once. Secrets expire (at most after 24 months):
+put the date in a calendar. Replacing the secret in the environment and restarting
+is all a renewal takes, because the stored credentials do not contain it and no
+mailbox has to be connected again.
+
+**4. Give the server the registration**, then restart it:
+
+```bash
+MICROSOFT_CLIENT_ID=<Application (client) ID>
+MICROSOFT_CLIENT_SECRET=<the secret's Value>
+MICROSOFT_TENANT=common            # or your tenant ID
+```
+
+(`docker-compose.yml` reads the same three with an `EMAILSERVER_` prefix.)
+
+**5. Connect a mailbox.** Ask your assistant to connect a Microsoft mailbox, open
+the link it returns, pick the account and approve. The page that follows says
+whether the mailbox is usable, and if not, why.
+
+What to know:
+
+- **Sending goes through Microsoft Graph, not SMTP.** Exchange Online ships with
+  SMTP AUTH switched off for the whole organisation, and turning it on is a
+  security decision for that organisation's administrator. Graph needs only the
+  user's own consent. Exchange files the message in *Sent Items* itself and keeps
+  its `Message-ID`, so a sent message is never indexed twice. Replies are
+  threaded, and `Bcc` recipients stay hidden from everyone else.
+- **Exchange keeps one body per message.** Send text and HTML and what arrives is
+  the HTML. Search is unaffected: the index extracts text from it.
+- **Calendar, contacts, tasks, notes and journal** are listed by Exchange as if
+  they were mail folders. They are left out of synchronisation and of
+  `list_mail_folders` for mailboxes in English, German, French, Spanish, Italian,
+  Dutch and Portuguese. For another language the server says so in its log and
+  indexes every folder; name the ones to skip in
+  `EMAILSERVER_EXCLUDED_SYNC_FOLDERS='["Kalendarz","Kontakty"]'`.
+- **IMAP can be switched off per mailbox.** The connection page then says so; an
+  administrator turns it on with
+  `Set-CASMailbox -Identity user@example.com -ImapEnabled $true`.
+- **Revoking.** Deleting the mailbox here removes the stored token but does not
+  revoke it at Microsoft. To do that, remove the app's consent under *Enterprise
+  applications* in Entra.
+- Personal Outlook.com accounts use the same flow, but this has only been
+  verified against Exchange Online work and school mailboxes.
 
 ## Deployment modes
 
@@ -336,19 +416,21 @@ that user log in once to claim the existing accounts, then set it back to `false
 ## Security model
 
 - Google OpenID Connect identifies an application user by the stable `sub` claim.
-- Each user owns multiple Gmail, Zoho, or generic IMAP/SMTP accounts.
+- Each user owns multiple Gmail, Microsoft 365, Zoho, or generic IMAP/SMTP accounts.
 - Mailbox credentials are separate from login identity and encrypted at rest.
 - MCP derives ownership from the authenticated token; callers never supply an owner ID.
 - Mailbox passwords are write-only tool and API inputs, and are never returned.
 - Original attachment binaries are not stored. A signed URL refetches them on demand.
 - Development mode is unauthenticated and must remain bound to loopback.
 
-Signing in does not grant access to any mailbox. Gmail is connected through a separate
-Gmail OAuth consent flow; Zoho and generic IMAP use provider app passwords.
+Signing in does not grant access to any mailbox. Gmail and Microsoft 365 are connected
+through separate OAuth consent flows; Zoho and generic IMAP use provider app passwords.
+A Microsoft mailbox's stored credential is its refresh token alone: the app registration's
+secret stays in the server's environment.
 
 ## MCP tools
 
-Nineteen tools, each annotated with read-only, destructive and open-world hints.
+Twenty-one tools, each annotated with read-only, destructive and open-world hints.
 It is a mail client, not a search box: everything you can do in Thunderbird you
 can do here, over an index instead of a folder listing.
 
@@ -359,6 +441,7 @@ can do here, over an index instead of a folder listing.
 | `update_mail_account` | change one mailbox's settings |
 | `begin_mail_account_password_setup` | short-lived password-only browser form |
 | `begin_gmail_connection` | five-minute signed URL for Google consent |
+| `begin_microsoft_connection` | five-minute signed URL for Microsoft consent |
 | `search_mail` | exhaustive lexical search |
 | `search_mail_regex` | bounded regex search |
 | `get_mail` | one message, bounded body |
@@ -452,6 +535,7 @@ DELETE /api/v1/accounts/{id}
 POST   /api/v1/accounts/{id}/test
 POST   /api/v1/accounts/{id}/sync
 GET    /api/v1/accounts/gmail/connect
+GET    /api/v1/accounts/microsoft/connect
 GET    /api/v1/emails/search
 GET    /api/v1/emails/search/regex
 GET    /api/v1/emails/{id}
@@ -475,6 +559,11 @@ The parts that make search trustworthy rather than best-effort:
 - Gmail OAuth accounts use `messages.list`/`get` for resumable backfill and
   `history.list` for incremental change. An expired history ID triggers a
   generation-marked full sync before upstream deletions are reconciled.
+- Microsoft 365 accounts synchronise over IMAP with an OAuth token, like any other
+  IMAP account, and send through Microsoft Graph. A copy of a message in Sent Items
+  and the one delivered to INBOX are the same message by `Message-ID`, though
+  Exchange lays their MIME out differently; an attachment is therefore found again
+  by its checksum rather than by its position.
 - Periodic metadata-only reconciliation mirrors flags and upstream deletions, with a
   durable checkpoint so a restart does not force a full rescan.
 - Account work is bounded by a global concurrency limit and protected by expiring
