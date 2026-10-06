@@ -1,11 +1,13 @@
 """Authenticated, tenant-scoped HTTP API."""
 
 import asyncio
+import base64
+import hashlib
 import logging
 import secrets
 from datetime import datetime
 from typing import Annotated
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -27,7 +29,18 @@ from src.security.account_connect_tokens import (
 )
 from src.security.auth import get_current_user, owned_account_query
 from src.security.download_tokens import issue_download_token, verify_download_token
-from src.security.provider_tokens import GMAIL_MAIL_SCOPE, encode_oauth_credential
+from src.security.provider_tokens import (
+    GMAIL_MAIL_SCOPE,
+    MICROSOFT_CONNECTION_SCOPES,
+    ProviderAuthError,
+    ProviderNotConfigured,
+    encode_microsoft_credential,
+    encode_oauth_credential,
+    microsoft_configured,
+    microsoft_endpoint,
+    microsoft_identity,
+    redeem_microsoft_authorization_code,
+)
 from src.security.upload_tokens import verify_upload_token
 from src.services.attachment_service import owned_attachment, refetch_attachment_bytes
 from src.services.mail_service import (
@@ -43,6 +56,7 @@ from src.services.mail_service import (
 from src.services.upload_service import store_upload_stream
 from src.web_pages import (
     invalid_setup_page,
+    microsoft_denied_page,
     password_form_page,
     password_saved_page,
 )
@@ -649,6 +663,209 @@ async def gmail_callback(
     db.commit()
     db.refresh(account)
     return RedirectResponse(url=f"{settings.public_base_url.rstrip('/')}?connected=gmail")
+
+
+# ---- Microsoft 365 / Exchange Online / Outlook.com ---------------------------------------------------
+
+MICROSOFT_IMAP_HOST = "outlook.office365.com"
+# Informational: Microsoft mailboxes send through Graph, because SMTP AUTH is
+# off by default for an Exchange Online organisation. See graph_sender.
+MICROSOFT_SMTP_HOST = "smtp.office365.com"
+
+
+def _microsoft_redirect_uri() -> str:
+    return f"{settings.public_base_url.rstrip('/')}/api/v1/accounts/microsoft/callback"
+
+
+def _start_microsoft_connection(request: Request, user: User) -> RedirectResponse:
+    if not microsoft_configured():
+        raise HTTPException(status_code=503, detail="Microsoft OAuth is not configured")
+    state = secrets.token_urlsafe(32)
+    # Bound to this browser session and checked on return: the state proves the
+    # callback answers this request, the nonce that the identity token does, and
+    # the verifier that whoever redeems the code is whoever asked for it.
+    nonce = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    )
+    request.session["microsoft_oauth_state"] = state
+    request.session["microsoft_oauth_nonce"] = nonce
+    request.session["microsoft_oauth_code_verifier"] = verifier
+    request.session["microsoft_connect_user_id"] = user.id
+    query = urlencode(
+        {
+            "client_id": settings.microsoft_client_id,
+            "response_type": "code",
+            "redirect_uri": _microsoft_redirect_uri(),
+            "response_mode": "query",
+            "scope": " ".join(MICROSOFT_CONNECTION_SCOPES),
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            # Without this a browser already signed in to one Microsoft account
+            # silently picks it, and the mailbox that gets connected is whichever
+            # one happened to be logged in rather than the one the owner meant.
+            "prompt": "select_account",
+        }
+    )
+    return RedirectResponse(f"{microsoft_endpoint(settings.microsoft_tenant, 'authorize')}?{query}")
+
+
+@router.get("/accounts/microsoft/connect")
+async def connect_microsoft(request: Request, user: CurrentUser):
+    return _start_microsoft_connection(request, user)
+
+
+@router.get("/accounts/microsoft/connect/mcp")
+async def connect_microsoft_from_mcp(
+    request: Request,
+    token: str,
+    db: Session = Depends(get_db),
+):
+    try:
+        user_id = verify_account_connect_token(token, provider="microsoft")
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    user = db.query(User).filter(User.id == user_id, User.status == "active").first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Account connection user is unavailable")
+    return _start_microsoft_connection(request, user)
+
+
+def _microsoft_account_name(db: Session, user: User, email: str) -> str:
+    name = f"Microsoft - {email}"
+    if owned_account_query(db, user).filter(SMTPConfig.name == name).first():
+        # Names are unique per owner and one may already be taken by an account
+        # added by hand; failing the whole connection over that would be absurd.
+        name = f"{name} ({secrets.token_hex(2)})"
+    return name
+
+
+@router.get("/accounts/microsoft/callback")
+async def microsoft_callback(
+    request: Request,
+    state: str | None = None,
+    code: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+    db: Session = Depends(get_db),
+):
+    expected_state = request.session.pop("microsoft_oauth_state", None)
+    if not expected_state or not state or not secrets.compare_digest(state, expected_state):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    user_id = request.session.pop("microsoft_connect_user_id", None)
+    code_verifier = request.session.pop("microsoft_oauth_code_verifier", None)
+    nonce = request.session.pop("microsoft_oauth_nonce", None)
+
+    if error:
+        logger.info("Microsoft consent for user %s ended with %s", user_id, error[:64])
+        return microsoft_denied_page(error, error_description or "")
+    if not code or not code_verifier or not nonce:
+        raise HTTPException(
+            status_code=400,
+            detail="Microsoft connection session expired; start the connection again",
+        )
+    user = db.query(User).filter(User.id == user_id, User.status == "active").first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Account connection session expired")
+
+    try:
+        tokens = await asyncio.to_thread(
+            redeem_microsoft_authorization_code,
+            code,
+            code_verifier,
+            _microsoft_redirect_uri(),
+            settings.microsoft_tenant,
+        )
+    except ProviderNotConfigured:
+        raise HTTPException(status_code=503, detail="Microsoft OAuth is not configured") from None
+    except ProviderAuthError as exc:
+        # Microsoft's own error code and description. Nothing secret is in them,
+        # and they are the only way an operator can tell a wrong client secret
+        # from a wrong redirect URI.
+        logger.warning("Microsoft refused the authorization code for user %s: %s", user.id, exc)
+        raise HTTPException(
+            status_code=400,
+            detail="Microsoft authorization failed; start the connection again",
+        ) from None
+    except Exception as exc:
+        logger.warning("Microsoft token exchange failed for user %s: %s", user.id, type(exc).__name__)
+        raise HTTPException(
+            status_code=400,
+            detail="Microsoft authorization failed; start the connection again",
+        ) from None
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="Microsoft did not return an offline refresh token")
+    if "IMAP.AccessAsUser.All" not in str(tokens.get("scope", "")):
+        # Consent was given for less than was asked, or this organisation
+        # blocks the permission. Either way no mail could be read.
+        raise HTTPException(
+            status_code=400,
+            detail="Microsoft did not grant access to read this mailbox over IMAP",
+        )
+    try:
+        identity = microsoft_identity(tokens, nonce=nonce)
+    except ValueError as exc:
+        logger.warning("Microsoft identity check failed for user %s: %s", user.id, exc)
+        raise HTTPException(status_code=400, detail="Microsoft sign-in could not be verified") from None
+
+    account = (
+        owned_account_query(db, user)
+        .filter(SMTPConfig.provider == "microsoft", SMTPConfig.provider_account_id == identity["subject"])
+        .first()
+    )
+    credential = encode_microsoft_credential(refresh_token, identity["tenant"])
+    if not account:
+        if owned_account_query(db, user).count() >= settings.max_accounts_per_user:
+            raise HTTPException(status_code=400, detail="Mail account limit reached")
+        account = SMTPConfig(
+            owner_user_id=user.id,
+            provider="microsoft",
+            auth_type="oauth2",
+            provider_account_id=identity["subject"],
+            name=_microsoft_account_name(db, user, identity["email"]),
+            account_name=identity["email"],
+            username=identity["email"],
+            host=MICROSOFT_IMAP_HOST,
+            port=993,
+            smtp_host=MICROSOFT_SMTP_HOST,
+            smtp_port=587,
+            imap_use_ssl=True,
+            imap_use_tls=False,
+            smtp_use_ssl=False,
+            smtp_use_tls=True,
+            enabled=True,
+            credential_ciphertext=credential,
+        )
+        db.add(account)
+    else:
+        account.credential_ciphertext = credential
+        account.enabled = True
+    account.sync_state = "healthy" if account.backfill_complete else "pending"
+    account.last_error_code = None
+    account.last_error_message = None
+    account.consecutive_failures = 0
+    account.retry_at = None
+    db.commit()
+    db.refresh(account)
+
+    # Microsoft's consent screen succeeding does not mean the mailbox works:
+    # IMAP can be switched off for it, and nothing about that is visible until
+    # something tries to log in. Say so now, while the owner is looking at this
+    # page, rather than leaving a quietly failing account behind.
+    connection = await safe_connection_test(account)
+    destination = f"{settings.public_base_url.rstrip('/')}?connected=microsoft"
+    if not all(connection.values()):
+        problem = "both" if not any(connection.values()) else ("imap" if not connection["imap"] else "send")
+        account.sync_state = "error"
+        account.last_error_code = "CONNECTION_TEST_FAILED"
+        account.last_error_message = "Saved configuration did not pass the connection test"
+        db.commit()
+        destination += f"&problem={problem}"
+    return RedirectResponse(url=destination)
 
 
 @router.get("/emails")

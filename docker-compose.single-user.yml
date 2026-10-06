@@ -61,6 +61,11 @@ services:
       # by app password. Unrelated to how you sign in to this server.
       EMAILSERVER_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       EMAILSERVER_GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # Optional: only needed to connect Microsoft 365 / Exchange Online
+      # mailboxes, which accept OAuth only.
+      EMAILSERVER_MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      EMAILSERVER_MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      EMAILSERVER_MICROSOFT_TENANT: ${MICROSOFT_TENANT:-common}
       FASTMCP_HOME: /data/fastmcp
     volumes:
       - emaildata:/data
