@@ -9,6 +9,7 @@ owner's behalf, so it outlives the account it was sent from, detached from it.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select, text, update
@@ -30,6 +31,13 @@ logger = logging.getLogger(__name__)
 # indefinitely is not.
 LOCK_TIMEOUT_MS = 30_000
 
+# How long a send can still be on its way once claimed. send_mail records the
+# claim as a 'pending' audit before it transmits and settles it afterwards, and
+# the transport's own timeouts end any attempt well inside this. A 'pending'
+# audit older than this belongs to a process that died mid-send; it must not
+# block deleting the account for good.
+IN_FLIGHT_SEND_WINDOW = timedelta(minutes=30)
+
 
 # lock_not_available (the lock_timeout above) and deadlock_detected. Anything
 # else -- a lost connection, say -- is not "busy" and must not be reported so.
@@ -40,14 +48,22 @@ def _contended(exc: OperationalError) -> bool:
     return getattr(exc.orig, "pgcode", None) in _CONTENDED
 
 
+def _busy(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"message": f"{message}; nothing was deleted. Try again shortly.", "retry_after": 30},
+    )
+
+
 def _lock_owned_account(db: Session, user_id: int, account_id: int) -> SMTPConfig:
     """Take the account row before touching anything that hangs off it.
 
     A sync worker's fence (sync_fence._check) locks this row first in every
-    transaction, too, so the two take their locks in the same order. Once this
-    lock is held, a worker transaction for the account waits for this one and
-    then finds the row gone: its fence check fails and the attempt ends without
-    writing a thing.
+    transaction, too, so the two take their locks in the same order. A worker
+    transaction already open on the account is waited for; one that begins
+    while this lock is held waits for this transaction and then finds the row
+    gone, so its fence check fails and it writes nothing. A worker between
+    transactions is fenced out at its next one.
     """
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text(f"SET LOCAL lock_timeout = '{int(LOCK_TIMEOUT_MS)}ms'"))
@@ -73,10 +89,7 @@ def delete_mail_account(db: Session, user_id: int, *, account_id: int, confirm_n
         db.rollback()
         if not _contended(exc):
             raise
-        raise HTTPException(
-            status_code=409,
-            detail="This account is busy synchronizing or being changed; nothing was deleted. Retry shortly.",
-        ) from exc
+        raise _busy("This account is held by a synchronization or another change") from exc
     except BaseException:
         db.rollback()
         raise
@@ -98,6 +111,18 @@ def _delete(db: Session, user_id: int, *, account_id: int, confirm_name: str | N
         ),
     }
     sends = db.scalar(select(func.count()).select_from(SendAudit).where(SendAudit.smtp_config_id == account.id))
+    # A send that has claimed but not settled would find its account gone
+    # mid-flight: delivered, yet reported as failed. Let it finish first. A new
+    # send cannot start meanwhile: its claim needs this row, which is locked.
+    in_flight = db.scalar(
+        select(func.count())
+        .select_from(SendAudit)
+        .where(
+            SendAudit.smtp_config_id == account.id,
+            SendAudit.status == "pending",
+            SendAudit.created_at >= datetime.now(timezone.utc).replace(tzinfo=None) - IN_FLIGHT_SEND_WINDOW,
+        )
+    )
 
     if confirm_name is None:
         db.rollback()
@@ -116,6 +141,8 @@ def _delete(db: Session, user_id: int, *, account_id: int, confirm_name: str | N
             status_code=400,
             detail="confirm_name does not match this account's name; nothing was deleted",
         )
+    if in_flight:
+        raise _busy("A message is being sent from this account right now")
 
     # Dependency order, spelled out rather than left to ON DELETE rules: SQLite
     # enforces none of them unless asked, and email_attachments has no cascade.

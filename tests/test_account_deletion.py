@@ -5,6 +5,7 @@ import json
 import pytest
 from fastmcp.exceptions import ToolError
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from src.config import settings
@@ -17,6 +18,13 @@ from src.models.send_audit import SendAudit
 from src.models.smtp_config import SMTPConfig
 from src.models.sync_cursor import MailSyncCursor
 from src.models.user import User
+from tests.test_inline_attachments import (  # noqa: F401  (service is a fixture)
+    _account,
+    _owner,
+    _slot,
+    _states,
+    service,
+)
 
 
 @pytest.fixture
@@ -54,7 +62,7 @@ def _owner_id(Session) -> int:
         return local_owner_user(db).id
 
 
-def _account(db, owner_id: int, name: str, address: str) -> SMTPConfig:
+def _mailbox(db, owner_id: int, name: str, address: str) -> SMTPConfig:
     account = SMTPConfig(
         owner_user_id=owner_id,
         provider="imap",
@@ -130,9 +138,9 @@ def mailboxes(Session):
         stranger = User(google_sub="someone-else", email="else@example.com")
         db.add(stranger)
         db.flush()
-        doomed = _account(db, owner, "progress.works", "owner@contoso.com")
-        kept = _account(db, owner, "Microsoft - owner@contoso.com", "owner@contoso.com")
-        foreign = _account(db, stranger.id, "Theirs", "else@example.com")
+        doomed = _mailbox(db, owner, "progress.works", "owner@contoso.com")
+        kept = _mailbox(db, owner, "Microsoft - owner@contoso.com", "owner@contoso.com")
+        foreign = _mailbox(db, stranger.id, "Theirs", "else@example.com")
         first = _message(db, doomed, 1)
         _message(db, doomed, 2)
         _message(db, kept, 3)
@@ -254,7 +262,7 @@ async def test_another_users_account_is_not_found_and_untouched(Session, mailbox
 async def test_an_account_that_never_sent_or_indexed_anything_deletes_too(Session, mailboxes):
     """The case that prompted this: a password account Exchange never let in."""
     with Session() as db:
-        empty = _account(db, mailboxes["owner"], "Never connected", "never@contoso.com")
+        empty = _mailbox(db, mailboxes["owner"], "Never connected", "never@contoso.com")
         db.commit()
         empty_id = empty.id
     delete = await _tool("delete_mail_account")
@@ -265,3 +273,107 @@ async def test_an_account_that_never_sent_or_indexed_anything_deletes_too(Sessio
     assert preview["would_remove"] == {"messages": 0, "attachments": 0}
     assert result["deleted"] is True
     assert _inventory(Session, empty_id)["account"] == 0
+
+
+# --------------------------------------------------------------------------
+# Sends racing a deletion
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_account_with_a_send_in_flight_is_not_deleted_until_it_settles(Session, mailboxes):
+    from datetime import datetime, timedelta, timezone
+
+    delete = await _tool("delete_mail_account")
+    with Session() as db:
+        pending = _audit(db, mailboxes["owner"], db.get(SMTPConfig, mailboxes["doomed"]), "in-flight")
+        pending.status = "pending"
+        db.commit()
+        pending_id = pending.id
+    before = _inventory(Session, mailboxes["doomed"])
+
+    with pytest.raises(ToolError) as busy:
+        await delete(account_id=mailboxes["doomed"], confirm_name="progress.works")
+
+    payload = json.loads(str(busy.value))
+    assert payload["code"] == "CONFLICT"
+    assert payload["details"] == {"retry_after": 30}
+    assert _inventory(Session, mailboxes["doomed"]) == before
+
+    # A 'pending' left behind by a process that died mid-send must not block it forever.
+    with Session() as db:
+        db.get(SendAudit, pending_id).created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+        db.commit()
+    result = await delete(account_id=mailboxes["doomed"], confirm_name="progress.works")
+    assert result["deleted"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_send_whose_account_is_deleted_before_its_claim_keeps_its_slots(service, monkeypatch):  # noqa: F811
+    """Nothing was sent, so the slot goes back to 'stored' -- not stranded in 'sending'."""
+    from src.services import mail_service
+    from src.services.account_deletion import delete_mail_account
+
+    engine = service.Session.kw["bind"]
+    event.listen(engine, "connect", lambda connection, _record: connection.execute("PRAGMA foreign_keys=ON"))
+    engine.dispose()
+    owner = _owner(service)
+    account = _account(service, owner.id)
+    slot = await _slot(service, filename="a.txt", payload=b"hello")
+    real_load = mail_service.load_uploads
+
+    def load_after_the_account_is_gone(db, claimed):
+        with service.Session() as other:
+            delete_mail_account(other, owner.id, account_id=account.id, confirm_name=account.name)
+        return real_load(db, claimed)
+
+    monkeypatch.setattr(mail_service, "load_uploads", load_after_the_account_is_gone)
+    send = await _tool("send_mail")
+
+    # The claim is refused by the account reference; the MCP layer reports it as a failed call.
+    with pytest.raises(IntegrityError):
+        await send(
+            account_id=account.id, to_addresses=["to@example.com"], subject="x", body_text="x",
+            upload_ids=[slot["upload_id"]],
+        )
+
+    assert service.sent == []
+    assert _states(service)[slot["upload_id"]] == "stored"
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_reply_is_reported_as_delivered_when_its_account_goes_right_after(service, monkeypatch):  # noqa: F811
+    from src.services import mail_service
+    from src.services.account_deletion import delete_mail_account
+
+    owner = _owner(service)
+    account = _account(service, owner.id)
+    with service.Session() as db:
+        original = EmailLog(
+            smtp_config_id=account.id, sender="a@example.com", recipient="owner@example.com", subject="Hi",
+            provider_message_id="INBOX:1:1", message_id="<original@example.com>", folder="INBOX",
+            imap_uid=1, uid_validity=1,
+        )
+        db.add(original)
+        db.commit()
+        original_id = original.id
+    real_settle = mail_service.settle_uploads
+
+    def settle_then_delete(db, claimed, *, outcome):
+        real_settle(db, claimed, outcome=outcome)
+        if outcome == "sent":
+            with service.Session() as other:
+                delete_mail_account(other, owner.id, account_id=account.id, confirm_name=account.name)
+
+    monkeypatch.setattr(mail_service, "settle_uploads", settle_then_delete)
+    send = await _tool("send_mail")
+
+    result = await send(
+        account_id=account.id, to_addresses=["a@example.com"], subject="Re: Hi", body_text="x",
+        reply_to_email_id=original_id,
+    )
+
+    assert result["success"] is True
+    assert result["threaded_reply"] is True
+    assert result["reply_to_email_id"] == original_id
+    assert len(service.sent) == 1

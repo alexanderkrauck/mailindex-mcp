@@ -1,5 +1,6 @@
 """Tenant-scoped search, retrieval, and sending."""
 
+import contextlib
 import hashlib
 import json
 import re
@@ -1417,11 +1418,18 @@ async def send_mail(
     from src.handlers.email_handler import email_sender_manager
 
     account = owned_account(db, user.id, payload.account_id)
+    # Read once, now: every commit below expires the ORM objects, and reading
+    # an attribute afterwards reloads the row -- which raises if the account
+    # (and with it the message being replied to) was deleted meanwhile, after
+    # the message may already have been delivered.
+    account_id = account.id
     reply_message = None
+    reply_to_id = None
     effective_send_options = dict(send_options or {})
     if payload.reply_to_email_id is not None:
         reply_message = owned_email(db, user.id, payload.reply_to_email_id)
-        if reply_message.smtp_config_id != account.id:
+        reply_to_id = reply_message.id
+        if reply_message.smtp_config_id != account_id:
             raise HTTPException(
                 status_code=400,
                 detail="A threaded reply must use the mailbox that owns the original message",
@@ -1559,8 +1567,8 @@ async def send_mail(
 
         audit = SendAudit(
             owner_user_id=user.id,
-            smtp_config_id=account.id,
-            reply_to_email_id=reply_message.id if reply_message else None,
+            smtp_config_id=account_id,
+            reply_to_email_id=reply_to_id,
             idempotency_key=key,
             recipients_json=json.dumps(recipients),
             subject=payload.subject,
@@ -1570,6 +1578,7 @@ async def send_mail(
         db.add(audit)
         db.commit()
         db.refresh(audit)
+        audit_id = audit.id
 
         # From here the message may reach an MTA, and anything that stops this
         # coroutine without a reported result -- a cancelled request, a worker
@@ -1578,7 +1587,7 @@ async def send_mail(
         # answers.
         outcome = "unknown"
         result = await email_sender_manager.send_email_via_config(
-            smtp_config_id=account.id,
+            smtp_config_id=account_id,
             owner_user_id=user.id,
             to_addresses=payload.to_addresses,
             subject=payload.subject,
@@ -1608,7 +1617,13 @@ async def send_mail(
         # a second time -- but an *ambiguous* one must not, or the retry
         # delivers the same confidential message twice. Defensively, because a
         # cleanup that raises here would strand the very slots it exists to
-        # free.
+        # free. A failed statement -- the claim refused because the account
+        # was deleted meanwhile, say -- leaves the session needing a rollback,
+        # and without one the settlement fails too and strands the slots in
+        # 'sending' until their lease lapses into 'unknown': a message never
+        # sent, reported as possibly delivered.
+        with contextlib.suppress(Exception):
+            db.rollback()
         settle_uploads(db, claimed, outcome=outcome)
         raise
     # Inside no try of its own but never able to raise: by this point the
@@ -1618,8 +1633,8 @@ async def send_mail(
     settle_uploads(db, claimed, outcome=outcome)
     return {
         **result,
-        "audit_id": audit.id,
+        "audit_id": audit_id,
         "idempotency_key": key,
         "threaded_reply": reply_message is not None,
-        "reply_to_email_id": reply_message.id if reply_message else None,
+        "reply_to_email_id": reply_to_id,
     }

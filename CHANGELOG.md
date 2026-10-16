@@ -16,8 +16,9 @@ Notable changes. Dates are release dates; the git history is finer grained.
   Exchange Online; the same bytes with CRLF were stored intact.
 - The draft builder writes CRLF, and the IMAP APPEND normalises whatever it is
   given, as `imaplib` does and `aioimaplib` does not. The MIME posted to Microsoft
-  Graph is generated with CRLF as well, since Exchange's MIME import parses it
-  too. SMTP was already correct: `smtplib` writes CRLF itself.
+  Graph is generated with CRLF as well, for conformance: sending never had the
+  drafts' damage, because the send path encodes text as base64 and so has no
+  soft breaks to lose. SMTP was already CRLF: `smtplib` writes it itself.
 - Clients no longer need to keep encoded lines short themselves. Long HTML and
   text lines round-trip unchanged through `save_draft` and `send_mail`.
 
@@ -28,18 +29,25 @@ Notable changes. Dates are release dates; the git history is finer grained.
   attachment text, participants, folder placements, sync checkpoints. Nothing at
   the provider changes, and the mailbox can be connected again. Called with only
   `account_id` it reports what would go; it deletes when `confirm_name` equals
-  the account's name. A synchronization running for the account is waited for
-  and then fenced out; one that holds on for more than 30 seconds gets
-  `CONFLICT`, and nothing is deleted.
+  the account's name. A synchronization step already writing to the account is
+  waited for (up to 30 seconds) and the rest of that synchronization fenced out.
+  While a step is still writing after that, or a send from the account has not
+  settled, the answer is `CONFLICT` with `retry_after`, and nothing is deleted.
 - The record of sent mail outlives the account it was sent from. Migration
   `20261016_17` makes `send_audits.smtp_config_id` nullable with
   `ON DELETE SET NULL`; it was `RESTRICT`, so an account that had ever sent mail
   could not be deleted at all. Downgrading refuses while records of deleted
   accounts exist, rather than deleting them.
-- The same migration indexes `email_attachments.email_log_id`. That foreign key
-  had no index, so deleting a message made PostgreSQL scan every attachment row
-  to check nothing still pointed at it. Deleting a 28,000-message account against
-  30,000 attachments took 45 seconds without the index and under one with it.
+- The same migration indexes `email_attachments.email_log_id` and
+  `send_audits.reply_to_email_id`. Both are foreign keys to `email_logs` that had
+  no index, so deleting a message made PostgreSQL scan each referencing table to
+  check nothing still pointed at it. Deleting a 28,000-message account, against
+  30,000 attachments and 20,000 send audits, took 48 seconds without them and
+  under one with them.
+- `send_mail` no longer reports a delivered reply as failed when its account is
+  deleted the moment it settles, and a send whose account is deleted before it
+  claims its upload slots hands them back instead of leaving them stuck in
+  `sending`.
 - `DELETE /api/v1/accounts/{id}` is unchanged: it disables an account and keeps
   its data.
 

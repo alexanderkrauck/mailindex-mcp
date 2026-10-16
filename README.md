@@ -503,10 +503,12 @@ message with its extracted attachment text, and the sync state. Nothing changes 
 the provider, so the mailbox can be connected again later and is then indexed from
 scratch; revoking the access granted there (Google account permissions, Microsoft
 My Apps) remains the owner's step. The record of mail sent through the account is
-kept, detached from it. A synchronization running for the account is waited for
-and then fenced out; one that holds on for more than 30 seconds gets a `CONFLICT`
-and nothing is deleted. `DELETE /api/v1/accounts/{id}` is different: it disables
-an account and keeps its data.
+kept, detached from it. A synchronization step already writing to the account is
+waited for (up to 30 seconds), and the rest of that synchronization is fenced out.
+While a step is still writing after that, or a send from the account has not
+finished, the answer is `CONFLICT` with `retry_after`, and nothing is deleted.
+`DELETE /api/v1/accounts/{id}` is different: it disables an account and keeps its
+data.
 
 **Search.** `search_mail` and `search_mail_regex` return `total_count`, `raw_count`,
 `returned_count`, `has_more`, and a signed `next_cursor`. Reuse the same filters with

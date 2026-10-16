@@ -226,17 +226,64 @@ jobs:
           print("index expression verified")
           PY
 
+      # A database built from nothing already has today's shape -- revision 01
+      # runs create_all with the current models -- so revision 17's conversion
+      # of a deployed v0.3.0 database would never run here. Restore that shape
+      # with 17's downgrade, prove it is the old one, and convert it again.
+      - name: Revision 17 converts a v0.3.0 schema
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          from alembic import command
+          from alembic.config import Config
+          from sqlalchemy import create_engine, inspect
+
+          from src.config import settings
+
+          config = Config("alembic.ini")
+          config.set_main_option("script_location", str(Path("alembic").resolve()))
+          config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+
+
+          def shape():
+              engine = create_engine(settings.database_url)
+              try:
+                  inspector = inspect(engine)
+                  column = next(c for c in inspector.get_columns("send_audits") if c["name"] == "smtp_config_id")
+                  reference = next(
+                      f for f in inspector.get_foreign_keys("send_audits")
+                      if f["constrained_columns"] == ["smtp_config_id"]
+                  )
+                  indexes = {
+                      index["name"]
+                      for table in ("email_attachments", "send_audits")
+                      for index in inspector.get_indexes(table)
+                  }
+                  return column["nullable"], reference["options"].get("ondelete"), indexes
+              finally:
+                  engine.dispose()
+
+
+          new = {"ix_email_attachments_email_log_id", "ix_send_audits_reply_to_email_id"}
+          command.downgrade(config, "20260922_16")
+          nullable, ondelete, indexes = shape()
+          assert (nullable, ondelete) == (False, "RESTRICT") and not new & indexes, (nullable, ondelete, indexes)
+          command.upgrade(config, "head")
+          nullable, ondelete, indexes = shape()
+          assert (nullable, ondelete) == (True, "SET NULL") and new <= indexes, (nullable, ondelete, indexes)
+          print("revision 17 conversion verified")
+          PY
+
       # What SQLite cannot show: PostgreSQL enforcing every foreign key while an
-      # account and everything indexed from it goes -- on the migrated schema,
-      # not one create_all built from the models. Runs last: it deletes the seed.
+      # account and everything indexed from it goes, on the schema revision 17
+      # just converted. Runs last: it deletes the seed.
       - name: Deleting an account removes its index and keeps its send audit
         run: |
           python - <<'PY'
           import json
 
-          from sqlalchemy import inspect
-
-          from src.database.connection import SessionLocal, engine
+          from src.database.connection import SessionLocal
           from src.models.attachment import EmailAttachment
           from src.models.email import EmailLog
           from src.models.placement import MessagePlacement
@@ -244,17 +291,6 @@ jobs:
           from src.models.smtp_config import SMTPConfig
           from src.models.sync_cursor import MailSyncCursor
           from src.services.account_deletion import delete_mail_account
-
-          inspector = inspect(engine)
-          column = next(c for c in inspector.get_columns("send_audits") if c["name"] == "smtp_config_id")
-          reference = next(
-              f for f in inspector.get_foreign_keys("send_audits") if f["constrained_columns"] == ["smtp_config_id"]
-          )
-          assert column["nullable"], column
-          assert reference["options"].get("ondelete") == "SET NULL", reference
-          # Without it, every deleted message scans the whole attachment table.
-          indexes = {index["name"] for index in inspector.get_indexes("email_attachments")}
-          assert "ix_email_attachments_email_log_id" in indexes, indexes
 
           with SessionLocal() as db:
               account = db.query(SMTPConfig).filter(SMTPConfig.name == "ci").one()

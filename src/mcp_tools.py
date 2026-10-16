@@ -290,7 +290,9 @@ def register_mcp_tools(mcp) -> None:
             "alone to see what would be removed, then again with confirm_name set to the "
             "account's exact name as list_mail_accounts shows it. The name confirms rather "
             "than the address because two accounts can share one -- an old password account "
-            "and a newer OAuth connection to the same mailbox, say."
+            "and a newer OAuth connection to the same mailbox, say. While a send from the "
+            "account or a synchronization step is still writing, it answers CONFLICT with "
+            "retry_after and deletes nothing."
         ),
         annotations=DESTRUCTIVE_LOCAL,
     )

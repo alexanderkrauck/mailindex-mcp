@@ -1,6 +1,6 @@
 """Make a mail account deletable.
 
-Two changes, both for delete_mail_account:
+Three changes, all for delete_mail_account:
 
 send_audits.smtp_config_id becomes nullable with ON DELETE SET NULL. send_audits is
 append-only: it records what this server sent on someone's behalf. Its account
@@ -8,11 +8,13 @@ reference was ON DELETE RESTRICT, so an account that had ever sent mail could no
 be deleted at all. Now the account and everything indexed from it can go while
 the record of what it sent stays.
 
-email_attachments.email_log_id gets an index. It is a foreign key without one, so
-deleting a message made PostgreSQL scan the whole attachment table to check that
-nothing still pointed at it -- once per message. Deleting a 28,000-message account
-took 45 seconds that way against 30,000 attachments, and under one second with
-the index.
+email_attachments.email_log_id and send_audits.reply_to_email_id get indexes.
+Both are foreign keys to email_logs without one, so deleting a message made
+PostgreSQL scan the whole referencing table -- once per deleted message. Against
+a 28,000-message account that cost 45 seconds with 30,000 attachments, and 17
+seconds with 20,000 send audits (which belong to every tenant and only grow);
+with both indexes the same deletion takes under a second. The deletion holds the
+account row for that long, which also stalls anything waiting on that row.
 
 Revision ID: 20261016_17
 Revises: 20260922_16
@@ -34,10 +36,12 @@ COLUMN = "smtp_config_id"
 # it keeps a migrated database and a fresh one identical.
 DEFAULT_NAME = "send_audits_smtp_config_id_fkey"
 
-ATTACHMENTS = "email_attachments"
-# The name SQLAlchemy gives index=True on the model, so a fresh install's
-# create_all and this migration produce the same index.
-ATTACHMENT_INDEX = "ix_email_attachments_email_log_id"
+# (table, column, index) -- each name is the one SQLAlchemy gives index=True on
+# the model, so a fresh install's create_all and this migration agree.
+INDEXES = (
+    ("email_attachments", "email_log_id", "ix_email_attachments_email_log_id"),
+    ("send_audits", "reply_to_email_id", "ix_send_audits_reply_to_email_id"),
+)
 
 
 def _account_reference(inspector) -> dict | None:
@@ -72,8 +76,9 @@ def upgrade() -> None:
                 batch.alter_column(COLUMN, existing_type=sa.Integer(), nullable=True)
                 batch.create_foreign_key(name, "smtp_configs", [COLUMN], ["id"], ondelete="SET NULL")
 
-    if ATTACHMENTS in tables and not _has_index(inspector, ATTACHMENTS, ATTACHMENT_INDEX):
-        op.create_index(ATTACHMENT_INDEX, ATTACHMENTS, ["email_log_id"])
+    for table, indexed_column, index in INDEXES:
+        if table in tables and not _has_index(inspector, table, index):
+            op.create_index(index, table, [indexed_column])
 
 
 def downgrade() -> None:
@@ -91,8 +96,9 @@ def downgrade() -> None:
                 "they would have to be removed before the account reference can be required again"
             )
 
-    if ATTACHMENTS in tables and _has_index(inspector, ATTACHMENTS, ATTACHMENT_INDEX):
-        op.drop_index(ATTACHMENT_INDEX, table_name=ATTACHMENTS)
+    for table, _column, index in INDEXES:
+        if table in tables and _has_index(inspector, table, index):
+            op.drop_index(index, table_name=table)
 
     if AUDITS in tables:
         foreign_key = _account_reference(inspector)
