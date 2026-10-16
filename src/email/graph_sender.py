@@ -145,8 +145,10 @@ class GraphMailSender:
             )
             if bcc_addresses:
                 msg["Bcc"] = ", ".join(bcc_addresses)
-            # CRLF, as on any wire. Exchange's MIME import -- the same one that
-            # misread the bare-LF soft breaks of drafts -- is what parses this.
+            # CRLF, as on any wire (RFC 5322), for conformance. This path never
+            # had the drafts' corruption -- compose_outbound_message encodes
+            # text parts as base64, so there are no quoted-printable soft
+            # breaks to misread -- but Exchange's MIME import parses it too.
             body = base64.b64encode(serialize_for_wire(msg))
         except OutboundCompositionError:
             return {

@@ -11,31 +11,36 @@ exactly as it is given.
 
 Python's own parser forgives a bare LF, so checking with it proves nothing: the
 old drafts parsed perfectly here. Every wire representation below is decoded the
-way Exchange decoded it instead, on each path that hands a message to a provider:
-both draft branches, the APPEND itself, Microsoft Graph and SMTP.
+way Exchange decoded it instead, on each path that hands a message to a provider,
+captured where it leaves for the provider: both draft branches (the IMAP literal
+and the Gmail API request), Microsoft Graph and SMTP. The send paths encode text
+as base64, so they never had soft breaks to lose; there the line endings and the
+content equality with the draft are what is checked.
 """
 
 import base64
 import email
 import hashlib
+import json
 from email import policy
+from email.utils import getaddresses
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+from src.email import sanitize_filename
 from src.email.draft_builder import build_draft, with_crlf_line_endings
 from src.email.graph_sender import GraphMailSender
 from src.email.imap_writer import append_message
 from tests.test_graph_sender import Graph, tokens  # noqa: F401  (tokens is a fixture)
 from tests.test_graph_sender import account as microsoft_account
-from tests.test_inline_attachments import (  # noqa: F401  (the last three are fixtures)
+from tests.test_inline_attachments import (  # noqa: F401  (service is a fixture)
     _account,
     _make_gmail,
     _owner,
     _slot,
     _tool,
-    gmail_drafts,
-    imap_drafts,
     service,
 )
 from tests.test_smtp_stale_connection import sender, smtp_server  # noqa: F401  (fixtures)
@@ -241,9 +246,91 @@ def test_a_draft_without_attachments_is_crlf_as_well():
     assert seen["html"] == html_for(CONTENT_ID)
 
 
+def test_headers_render_exactly_as_before_only_with_crlf():
+    """Display names, encoded words and an RFC 2231 filename parse back to what was given.
+
+    Serializing with a different policy (compat32, say) would still be CRLF and
+    would still decode the bodies -- and would mangle these.
+    """
+    to = ['"Doe, John" <jd@example.com>', "Zoë Ärger <z@example.com>"] + [f"u{n}@example.com" for n in range(6)]
+    cc = ["Jörg Müller-Lüdenscheidt <jm@example.com>"]
+    filename = "Prüfbericht über die Qualität der Zeilenumbrüche im Oktober 2026 – endgültig.txt"
+    raw = build_draft(
+        sender="owner@contoso.com",
+        to_addresses=to,
+        cc_addresses=cc,
+        subject="Grüße – eine Prüfung der Kopfzeilen, lang genug, um gefaltet zu werden",
+        body_text=BODY_TEXT,
+        body_html="<p>Grüße</p>",
+        headers={},
+        attachments=[{"data": ATTACHMENT, "filename": filename, "content_type": "text/plain",
+                      "disposition": "attachment", "content_id": None}],
+    )
+
+    assert_crlf_only(raw)
+    message = email.message_from_bytes(raw, policy=policy.default)
+    assert getaddresses([str(message["To"])]) == getaddresses(to)
+    assert getaddresses([str(message["Cc"])]) == getaddresses(cc)
+    assert str(message["Subject"]) == "Grüße – eine Prüfung der Kopfzeilen, lang genug, um gefaltet zu werden"
+    attachment = next(part for part in message.walk() if part.get_content_disposition() == "attachment")
+    assert attachment.get_filename() == sanitize_filename(filename)  # spaces become underscores, umlauts stay
+    assert "ü" in attachment.get_filename()
+    assert attachment.get_payload(decode=True) == ATTACHMENT
+
+
 # --------------------------------------------------------------------------
-# Both draft branches, through the real tool
+# Both draft branches, through the real tool, captured at the provider
 # --------------------------------------------------------------------------
+
+
+class _RecordingImap:
+    """Stands in for the aioimaplib client: records each APPEND literal as given."""
+
+    def __init__(self):
+        self.literals: list[bytes] = []
+
+    async def append(self, message_bytes, mailbox=None, flags=None):
+        self.literals.append(message_bytes)
+        return SimpleNamespace(result="OK", lines=[b"[APPENDUID 9 41] APPEND completed."])
+
+
+@pytest.fixture
+def imap_wire(monkeypatch):
+    """The literal the real append_message hands to the IMAP library."""
+    from src.services import write_service
+
+    imap = _RecordingImap()
+
+    async def fake_with_mailbox(db, config, operation):
+        return await operation(SimpleNamespace(client=imap))
+
+    async def fake_list_folders(client):
+        return [{"name": "Drafts", "special_use": "drafts"}]
+
+    monkeypatch.setattr(write_service, "_with_mailbox", fake_with_mailbox)
+    monkeypatch.setattr(write_service, "list_folders", fake_list_folders)
+    return imap
+
+
+@pytest.fixture
+def gmail_wire(monkeypatch):
+    """The message the real GmailApiClient posts to Gmail's drafts endpoint."""
+    from src.email.gmail_api_client import GmailApiClient
+    from src.services import write_service
+
+    posted: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/drafts")
+        posted.append(base64.urlsafe_b64decode(json.loads(request.content)["message"]["raw"]))
+        return httpx.Response(200, json={"id": "draft-1", "message": {"id": "m-1"}})
+
+    async def fake_gmail(db, config, operation):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            return await operation(GmailApiClient(config, http_client=http, access_token="token"))
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    return posted
 
 
 async def _save_through_the_tool(app, account_id: int) -> str:
@@ -264,36 +351,29 @@ async def _save_through_the_tool(app, account_id: int) -> str:
 
 
 @pytest.mark.asyncio
-async def test_save_draft_files_bytes_that_survive_on_the_imap_branch(service, imap_drafts):  # noqa: F811
+async def test_save_draft_files_bytes_that_survive_on_the_imap_branch(service, imap_wire):  # noqa: F811
     account = _account(service, _owner(service).id)
 
     content_id = await _save_through_the_tool(service, account.id)
 
-    assert_round_trips(imap_drafts["raw"], content_id)
+    assert len(imap_wire.literals) == 1
+    assert_round_trips(imap_wire.literals[0], content_id)
 
 
 @pytest.mark.asyncio
-async def test_save_draft_creates_bytes_that_survive_on_the_gmail_branch(service, gmail_drafts):  # noqa: F811
+async def test_save_draft_creates_bytes_that_survive_on_the_gmail_branch(service, gmail_wire):  # noqa: F811
     account = _account(service, _owner(service).id)
     _make_gmail(service, account.id)
 
     content_id = await _save_through_the_tool(service, account.id)
 
-    assert_round_trips(gmail_drafts["raw"], content_id)
+    assert len(gmail_wire) == 1
+    assert_round_trips(gmail_wire[0], content_id)
 
 
 # --------------------------------------------------------------------------
 # The APPEND itself
 # --------------------------------------------------------------------------
-
-
-class _RecordingImap:
-    def __init__(self):
-        self.literals: list[bytes] = []
-
-    async def append(self, message_bytes, mailbox=None, flags=None):
-        self.literals.append(message_bytes)
-        return SimpleNamespace(result="OK", lines=[b"[APPENDUID 9 41] APPEND completed."])
 
 
 @pytest.mark.asyncio
@@ -318,7 +398,8 @@ async def test_append_leaves_a_crlf_literal_alone():
     await append_message(SimpleNamespace(client=imap), "Drafts", raw, flags=[])
 
     assert imap.literals == [raw]
-    assert with_crlf_line_endings(raw) == raw
+    # Not even copied: a draft can be 35 MB, and this runs on the event loop.
+    assert with_crlf_line_endings(raw) is raw
 
 
 # --------------------------------------------------------------------------

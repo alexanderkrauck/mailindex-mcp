@@ -213,6 +213,13 @@ async def append_message(client, folder: str, raw: bytes, *, flags: list[str]) -
     RFC 3501 requires them, aioimaplib (unlike imaplib) does not add them, and
     Exchange Online misreads a quoted-printable soft break that ends in a bare
     LF -- see ``draft_builder.with_crlf_line_endings``.
+
+    ``raw`` must be a message composed here (build_draft), never one fetched
+    from a mailbox: the normalisation would rewrite CR and LF bytes inside a
+    part sent with Content-Transfer-Encoding binary, where they are content
+    rather than line endings. A composed message has no such part: its text
+    parts are text, whose line breaks are line endings, and its attachments
+    are base64.
     """
     raw = with_crlf_line_endings(raw)
     response = await client.client.append(

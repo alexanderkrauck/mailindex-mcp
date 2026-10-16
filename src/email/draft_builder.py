@@ -95,7 +95,15 @@ def with_crlf_line_endings(raw: bytes) -> bytes:
     hands bytes to it has to do this itself. Idempotent, and safe for anything
     a composer here produces: attachments are base64, so no part carries raw
     binary whose line breaks would be content.
+
+    Input that is already CRLF throughout -- everything build_draft returns --
+    comes back as the same object. Rewriting it anyway costs a second copy of a
+    draft that can be 35 MB, on the event loop, to change nothing; counting
+    costs no allocation.
     """
+    crlf = raw.count(b"\r\n")
+    if raw.count(b"\n") == crlf and raw.count(b"\r") == crlf:
+        return raw
     return _ANY_LINE_ENDING.sub(b"\r\n", raw)
 
 
