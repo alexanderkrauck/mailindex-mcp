@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from src.config import settings
+from src.email.draft_builder import serialize_for_wire
 from src.email.smtp_sender import OutboundCompositionError, compose_outbound_message
 from src.security.provider_tokens import ProviderAuthError, ProviderNotConfigured, access_token_for
 
@@ -144,7 +145,11 @@ class GraphMailSender:
             )
             if bcc_addresses:
                 msg["Bcc"] = ", ".join(bcc_addresses)
-            body = base64.b64encode(msg.as_bytes())
+            # CRLF, as on any wire (RFC 5322), for conformance. This path never
+            # had the drafts' corruption -- compose_outbound_message encodes
+            # text parts as base64, so there are no quoted-printable soft
+            # breaks to misread -- but Exchange's MIME import parses it too.
+            body = base64.b64encode(serialize_for_wire(msg))
         except OutboundCompositionError:
             return {
                 "success": False,

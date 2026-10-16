@@ -75,6 +75,46 @@ _CID_CONTINUATION = r"A-Za-z0-9!$%*+/=^_`{|}~@-"
 # them as terminators cannot cost a genuine continuation.
 _CID_DOT_CONTINUES = r"\.[^\s\"'<>)\,;!\]}:]"
 
+# Every line of a message on the wire ends in CRLF (RFC 5322), and so does the
+# literal of an IMAP APPEND (RFC 3501). EmailMessage's default policy writes
+# bare LF, which no Python parser minds -- but RFC 2045 defines the
+# quoted-printable soft line break as "=" followed by CRLF, and Exchange Online
+# does not read "=" + LF as one. Reproduced on 16 October 2026: a draft filed
+# with bare LF came back with "=" in place of the first character after every
+# soft break ("länger" became "läng=r", "</span>" became "<=span>"), UTF-8
+# sequences that a break had split were destroyed, and a cid: URL that crossed a
+# break no longer matched its image. The same bytes with CRLF were stored intact.
+_ANY_LINE_ENDING = re.compile(rb"\r\n|\r(?!\n)|\n")
+
+
+def with_crlf_line_endings(raw: bytes) -> bytes:
+    """``raw`` with every line ending, LF or lone CR alike, turned into CRLF.
+
+    The same normalisation the standard library's imaplib applies to every
+    APPEND literal. aioimaplib sends the literal exactly as given, so whatever
+    hands bytes to it has to do this itself. Idempotent, and safe for anything
+    a composer here produces: attachments are base64, so no part carries raw
+    binary whose line breaks would be content.
+
+    Input that is already CRLF throughout -- everything build_draft returns --
+    comes back as the same object. Rewriting it anyway costs a second copy of a
+    draft that can be 35 MB, on the event loop, to change nothing; counting
+    costs no allocation.
+    """
+    crlf = raw.count(b"\r\n")
+    if raw.count(b"\n") == crlf and raw.count(b"\r") == crlf:
+        return raw
+    return _ANY_LINE_ENDING.sub(b"\r\n", raw)
+
+
+def serialize_for_wire(message) -> bytes:
+    """The bytes of ``message`` as a provider must receive them: CRLF throughout.
+
+    Generated with CRLF rather than converted afterwards, so the generator
+    writes each quoted-printable soft break as "=" CRLF in the first place.
+    """
+    return message.as_bytes(policy=message.policy.clone(linesep="\r\n"))
+
 
 @dataclass(frozen=True)
 class OutboundPart:
@@ -267,7 +307,7 @@ def build_draft(
                 subtype=part.subtype,
                 filename=part.filename,
             )
-        return message.as_bytes()
+        return serialize_for_wire(message)
 
     # The body and the parts it points at belong together inside one
     # multipart/related, or a client has no reason to resolve the cid: URLs.
@@ -296,4 +336,4 @@ def build_draft(
     # unlike set_content; without it the top level is not formally MIME.
     if "MIME-Version" not in message:
         message["MIME-Version"] = "1.0"
-    return message.as_bytes()
+    return serialize_for_wire(message)
