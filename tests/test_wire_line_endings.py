@@ -390,6 +390,13 @@ async def test_append_sends_its_literal_with_crlf_whatever_it_was_given():
     )
 
 
+def test_a_lone_cr_among_crlf_is_still_rewritten():
+    """The shortcut for canonical input must not mistake one lone CR for canonical."""
+    raw = b"Subject: x\r\n\r\na\r\nlone\rcr\r\n"
+
+    assert with_crlf_line_endings(raw) == b"Subject: x\r\n\r\na\r\nlone\r\ncr\r\n"
+
+
 @pytest.mark.asyncio
 async def test_append_leaves_a_crlf_literal_alone():
     imap = _RecordingImap()
