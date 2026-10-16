@@ -47,7 +47,8 @@ def _error_payload(exc: HTTPException) -> dict:
     payload = {
         "code": code,
         "message": message[:500],
-        "retryable": exc.status_code in {429, 502, 503, 504},
+        # A refusal that names when to come back is one to come back to.
+        "retryable": exc.status_code in {429, 502, 503, 504} or "retry_after" in (details or {}),
     }
     if details:
         payload["details"] = details

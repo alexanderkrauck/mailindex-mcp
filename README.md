@@ -4,7 +4,7 @@
 [![image](https://img.shields.io/badge/ghcr.io-mailindex--mcp-blue?logo=docker&logoColor=white)](https://github.com/alexanderkrauck/mailindex-mcp/pkgs/container/mailindex-mcp)
 [![CI](https://github.com/alexanderkrauck/mailindex-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alexanderkrauck/mailindex-mcp/actions/workflows/ci.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-green)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-21%20tools-8A2BE2)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-22%20tools-8A2BE2)](#mcp-tools)
 
 **A mail client for an AI agent. Everything you can do in Thunderbird — search,
 move, mark, delete, draft — over your own index, on your own machine.**
@@ -46,7 +46,7 @@ accounts. One string is blurred: a case number belonging to a real filing.</sub>
 | Transport | Remote HTTP endpoint | Local stdio process on your machine |
 | Setup on the client | Paste a URL | Install a runtime, edit config JSON, store credentials locally |
 | Users | Multi-tenant, every row owner-scoped | Single user |
-| Tool surface | 21 tools, all annotated | Frequently 40+ |
+| Tool surface | 22 tools, all annotated | Frequently 40+ |
 
 **What it costs you, stated up front.** You run PostgreSQL and a container. The
 index is about **28 MB per 1,000 messages** — a 50,000-message archive is roughly
@@ -430,7 +430,7 @@ secret stays in the server's environment.
 
 ## MCP tools
 
-Twenty-one tools, each annotated with read-only, destructive and open-world hints.
+Twenty-two tools, each annotated with read-only, destructive and open-world hints.
 It is a mail client, not a search box: everything you can do in Thunderbird you
 can do here, over an index instead of a folder listing.
 
@@ -439,6 +439,7 @@ can do here, over an index instead of a folder listing.
 | `list_mail_accounts` | accounts, non-secret settings, exact stored message counts |
 | `add_mail_account` | add an IMAP/SMTP mailbox |
 | `update_mail_account` | change one mailbox's settings |
+| `delete_mail_account` | remove an account and everything indexed from it; nothing at the provider |
 | `begin_mail_account_password_setup` | short-lived password-only browser form |
 | `begin_gmail_connection` | five-minute signed URL for Google consent |
 | `begin_microsoft_connection` | five-minute signed URL for Microsoft consent |
@@ -447,6 +448,7 @@ can do here, over an index instead of a folder listing.
 | `get_mail` | one message, bounded body |
 | `get_thread` | reconstructed thread with confidence |
 | `get_attachment` | metadata, extracted text, expiring download URL |
+| `begin_attachment_upload` | signed slot for new file bytes, attached or embedded inline |
 | `send_mail` | send or reply, with owned attachments |
 | `list_mail_folders` | folders of one mailbox, with declared roles and indexed counts |
 | `create_mail_folder` | create and subscribe to a folder |
@@ -491,6 +493,23 @@ write-only password. When a client will not transmit secrets, omit it and open t
 returned setup URL, or call `begin_mail_account_password_setup`; the linked form asks
 only for the password. A failed connection test keeps both the configuration and the
 encrypted credential, so settings can be corrected without re-entering it.
+
+**Removing an account.** `delete_mail_account` takes two calls. The first, with
+only `account_id`, reports what would go; the second deletes, and only when
+`confirm_name` equals the account's name exactly -- the name rather than the
+address, because an old password account and a newer OAuth connection can share
+one mailbox. Gone afterwards: the stored credential, the settings, every indexed
+message with its extracted attachment text, and the sync state. Nothing changes at
+the provider, so the mailbox can be connected again later and is then indexed from
+scratch; revoking the access granted there (Google account permissions, Microsoft
+My Apps) remains the owner's step. The record of mail sent through the account is
+kept, detached from it. A synchronization step already writing to the account is
+waited for (up to 30 seconds), and the rest of that synchronization is fenced out.
+While a step is still writing after that, or a send from the account that has
+recorded its claim has not finished, the answer is `CONFLICT` with `retry_after`,
+and nothing is deleted. A send the deletion overtakes fails with nothing sent.
+`DELETE /api/v1/accounts/{id}` is different: it disables an account and keeps its
+data.
 
 **Search.** `search_mail` and `search_mail_regex` return `total_count`, `raw_count`,
 `returned_count`, `has_more`, and a signed `next_cursor`. Reuse the same filters with
