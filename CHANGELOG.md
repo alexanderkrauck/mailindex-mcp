@@ -2,6 +2,47 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.3.1 — 2026-10-16
+
+### Drafts keep their text on Exchange Online
+
+- Every message handed to a provider now has CRLF line endings, as RFC 5322 and
+  RFC 3501 require. Drafts were serialized with bare LF, which Python's own parser
+  accepts -- but Exchange Online does not read "=" followed by LF as a
+  quoted-printable soft line break. A draft saved there came back with "=" in place
+  of the first character after every soft break ("läng=r", "<=span>"), UTF-8
+  sequences a break had split were lost, and a `cid:` URL that crossed a break no
+  longer matched its image, so inline images did not render. Reproduced against
+  Exchange Online; the same bytes with CRLF were stored intact.
+- The draft builder writes CRLF, and the IMAP APPEND normalises whatever it is
+  given, as `imaplib` does and `aioimaplib` does not. The MIME posted to Microsoft
+  Graph is generated with CRLF as well, since Exchange's MIME import parses it
+  too. SMTP was already correct: `smtplib` writes CRLF itself.
+- Clients no longer need to keep encoded lines short themselves. Long HTML and
+  text lines round-trip unchanged through `save_draft` and `send_mail`.
+
+### Deleting a mail account
+
+- `delete_mail_account` removes an account from this server: the stored
+  credential, the settings, and everything indexed from it -- messages, extracted
+  attachment text, participants, folder placements, sync checkpoints. Nothing at
+  the provider changes, and the mailbox can be connected again. Called with only
+  `account_id` it reports what would go; it deletes when `confirm_name` equals
+  the account's name. A synchronization running for the account is waited for
+  and then fenced out; one that holds on for more than 30 seconds gets
+  `CONFLICT`, and nothing is deleted.
+- The record of sent mail outlives the account it was sent from. Migration
+  `20261016_17` makes `send_audits.smtp_config_id` nullable with
+  `ON DELETE SET NULL`; it was `RESTRICT`, so an account that had ever sent mail
+  could not be deleted at all. Downgrading refuses while records of deleted
+  accounts exist, rather than deleting them.
+- The same migration indexes `email_attachments.email_log_id`. That foreign key
+  had no index, so deleting a message made PostgreSQL scan every attachment row
+  to check nothing still pointed at it. Deleting a 28,000-message account against
+  30,000 attachments took 45 seconds without the index and under one with it.
+- `DELETE /api/v1/accounts/{id}` is unchanged: it disables an account and keeps
+  its data.
+
 ## v0.3.0 — 2026-10-06
 
 ### Microsoft 365 / Exchange Online

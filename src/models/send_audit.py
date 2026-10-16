@@ -12,7 +12,9 @@ class SendAudit(Base):
 
     id = Column(Integer, primary_key=True)
     owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    smtp_config_id = Column(Integer, ForeignKey("smtp_configs.id", ondelete="RESTRICT"), nullable=False)
+    # Null once the account it was sent from has been deleted: the record of
+    # what this server sent on the owner's behalf outlives the account.
+    smtp_config_id = Column(Integer, ForeignKey("smtp_configs.id", ondelete="SET NULL"), nullable=True)
     reply_to_email_id = Column(
         Integer,
         ForeignKey("email_logs.id", ondelete="SET NULL"),

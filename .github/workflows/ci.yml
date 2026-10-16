@@ -226,6 +226,67 @@ jobs:
           print("index expression verified")
           PY
 
+      # What SQLite cannot show: PostgreSQL enforcing every foreign key while an
+      # account and everything indexed from it goes -- on the migrated schema,
+      # not one create_all built from the models. Runs last: it deletes the seed.
+      - name: Deleting an account removes its index and keeps its send audit
+        run: |
+          python - <<'PY'
+          import json
+
+          from sqlalchemy import inspect
+
+          from src.database.connection import SessionLocal, engine
+          from src.models.attachment import EmailAttachment
+          from src.models.email import EmailLog
+          from src.models.placement import MessagePlacement
+          from src.models.send_audit import SendAudit
+          from src.models.smtp_config import SMTPConfig
+          from src.models.sync_cursor import MailSyncCursor
+          from src.services.account_deletion import delete_mail_account
+
+          inspector = inspect(engine)
+          column = next(c for c in inspector.get_columns("send_audits") if c["name"] == "smtp_config_id")
+          reference = next(
+              f for f in inspector.get_foreign_keys("send_audits") if f["constrained_columns"] == ["smtp_config_id"]
+          )
+          assert column["nullable"], column
+          assert reference["options"].get("ondelete") == "SET NULL", reference
+          # Without it, every deleted message scans the whole attachment table.
+          indexes = {index["name"] for index in inspector.get_indexes("email_attachments")}
+          assert "ix_email_attachments_email_log_id" in indexes, indexes
+
+          with SessionLocal() as db:
+              account = db.query(SMTPConfig).filter(SMTPConfig.name == "ci").one()
+              replied = db.query(EmailLog).filter(EmailLog.smtp_config_id == account.id).first()
+              db.add_all([
+                  EmailAttachment(email_log_id=replied.id, filename="ci.txt", size=1, extraction_state="complete"),
+                  MailSyncCursor(smtp_config_id=account.id, folder="INBOX", uid_validity=1, last_uid=4),
+                  SendAudit(
+                      owner_user_id=account.owner_user_id, smtp_config_id=account.id,
+                      reply_to_email_id=replied.id, idempotency_key="ci-sent",
+                      recipients_json=json.dumps(["to@example.invalid"]), subject="ci",
+                      request_hash="0" * 64, status="sent",
+                  ),
+              ])
+              db.commit()
+              owner, account_id = account.owner_user_id, account.id
+
+          with SessionLocal() as db:
+              result = delete_mail_account(db, owner, account_id=account_id, confirm_name="ci")
+          assert result["deleted"] and result["removed"] == {"messages": 3, "attachments": 1}, result
+
+          with SessionLocal() as db:
+              assert db.get(SMTPConfig, account_id) is None
+              assert db.query(EmailLog).count() == 0
+              assert db.query(EmailAttachment).count() == 0
+              assert db.query(MessagePlacement).count() == 0
+              assert db.query(MailSyncCursor).count() == 0
+              audit = db.query(SendAudit).one()
+              assert (audit.smtp_config_id, audit.reply_to_email_id, audit.subject) == (None, None, "ci"), vars(audit)
+          print("account deletion verified")
+          PY
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

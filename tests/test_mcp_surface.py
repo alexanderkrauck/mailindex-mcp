@@ -32,8 +32,15 @@ async def test_mcp_tool_surface_is_narrow_and_annotated():
         "create_mail_folder",
         "delete_mail_folder",
         "rename_mail_folder",
+        "delete_mail_account",
     }
     assert all(tool.annotations is not None for tool in tools)
+    deletion = next(tool for tool in tools if tool.name == "delete_mail_account")
+    # Destructive, but only of this server's own data: the provider is never touched.
+    assert deletion.annotations.destructiveHint is True
+    assert deletion.annotations.openWorldHint is False
+    assert "confirm_name" in deletion.parameters["properties"]
+    assert "confirm_name" not in deletion.parameters.get("required", [])
     assert next(tool for tool in tools if tool.name == "search_mail").annotations.readOnlyHint is True
     account_schema = next(
         tool for tool in tools if tool.name == "list_mail_accounts"

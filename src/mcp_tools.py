@@ -1,5 +1,6 @@
 """Small, deliberate MCP tool surface."""
 
+import asyncio
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -25,6 +26,7 @@ from src.security.download_tokens import issue_download_token
 from src.security.mcp_errors import mcp_error_boundary
 from src.security.provider_tokens import microsoft_configured
 from src.security.upload_tokens import issue_upload_token
+from src.services.account_deletion import delete_mail_account as remove_mail_account
 from src.services.attachment_service import (
     owned_attachment,
     refetch_attachment_bytes,
@@ -86,6 +88,13 @@ DESTRUCTIVE_EXTERNAL = ToolAnnotations(
     destructiveHint=True,
     idempotentHint=False,
     openWorldHint=True,
+)
+# Destroys this server's own data and nothing at the provider.
+DESTRUCTIVE_LOCAL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
 )
 
 
@@ -266,6 +275,42 @@ def register_mcp_tools(mcp) -> None:
         )
         with SessionLocal() as db:
             return await update_account(account_id, payload, user, db)
+
+    @mcp.tool(
+        name="delete_mail_account",
+        description=(
+            "Remove a mail account from this server for good: its stored credential, its "
+            "settings and everything indexed from it (messages, extracted attachment text, "
+            "folder placements, sync state). Nothing is deleted at the provider: the mailbox "
+            "itself is untouched and can be connected again later, when it is indexed from "
+            "scratch. The record of mail sent through the account is kept. Cannot be undone, "
+            "and it does not revoke the access the provider granted (Google account "
+            "permissions, Microsoft My Apps).\n\n"
+            "Two steps, so the wrong account cannot go by accident: call it with account_id "
+            "alone to see what would be removed, then again with confirm_name set to the "
+            "account's exact name as list_mail_accounts shows it. The name confirms rather "
+            "than the address because two accounts can share one -- an old password account "
+            "and a newer OAuth connection to the same mailbox, say."
+        ),
+        annotations=DESTRUCTIVE_LOCAL,
+    )
+    @mcp_error_boundary
+    async def delete_mail_account(account_id: int, confirm_name: str | None = None) -> dict:
+        from src.handlers.email_handler import email_sender_manager
+
+        user = await current_mcp_user()
+
+        def run() -> dict:
+            # Its own thread and session: deleting a large account is seconds of
+            # database work that must not stall the event loop serving everyone.
+            with SessionLocal() as db:
+                return remove_mail_account(db, user.id, account_id=account_id, confirm_name=confirm_name)
+
+        result = await asyncio.to_thread(run)
+        if result["deleted"]:
+            # A cached SMTP connection would otherwise outlive its account.
+            await email_sender_manager.invalidate(account_id)
+        return result
 
     @mcp.tool(
         name="begin_mail_account_password_setup",

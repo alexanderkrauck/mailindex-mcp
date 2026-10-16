@@ -13,7 +13,7 @@ class EmailAttachment(Base):
     __tablename__ = "email_attachments"
 
     id = Column(Integer, primary_key=True)
-    email_log_id = Column(Integer, ForeignKey("email_logs.id"), nullable=False)
+    email_log_id = Column(Integer, ForeignKey("email_logs.id"), nullable=False, index=True)
 
     filename = Column(String(500), nullable=False)
     content_type = Column(String(100), nullable=True)
