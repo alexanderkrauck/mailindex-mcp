@@ -505,8 +505,9 @@ scratch; revoking the access granted there (Google account permissions, Microsof
 My Apps) remains the owner's step. The record of mail sent through the account is
 kept, detached from it. A synchronization step already writing to the account is
 waited for (up to 30 seconds), and the rest of that synchronization is fenced out.
-While a step is still writing after that, or a send from the account has not
-finished, the answer is `CONFLICT` with `retry_after`, and nothing is deleted.
+While a step is still writing after that, or a send from the account that has
+recorded its claim has not finished, the answer is `CONFLICT` with `retry_after`,
+and nothing is deleted. A send the deletion overtakes fails with nothing sent.
 `DELETE /api/v1/accounts/{id}` is different: it disables an account and keeps its
 data.
 

@@ -31,8 +31,10 @@ Notable changes. Dates are release dates; the git history is finer grained.
   `account_id` it reports what would go; it deletes when `confirm_name` equals
   the account's name. A synchronization step already writing to the account is
   waited for (up to 30 seconds) and the rest of that synchronization fenced out.
-  While a step is still writing after that, or a send from the account has not
-  settled, the answer is `CONFLICT` with `retry_after`, and nothing is deleted.
+  While a step is still writing after that, or a send from the account that has
+  recorded its claim has not settled, the answer is `CONFLICT` with
+  `retry_after` (and `retryable: true`), and nothing is deleted. A send the
+  deletion overtakes fails with nothing sent.
 - The record of sent mail outlives the account it was sent from. Migration
   `20261016_17` makes `send_audits.smtp_config_id` nullable with
   `ON DELETE SET NULL`; it was `RESTRICT`, so an account that had ever sent mail
@@ -45,9 +47,9 @@ Notable changes. Dates are release dates; the git history is finer grained.
   30,000 attachments and 20,000 send audits, took 48 seconds without them and
   under one with them.
 - `send_mail` no longer reports a delivered reply as failed when its account is
-  deleted the moment it settles, and a send whose account is deleted before it
-  claims its upload slots hands them back instead of leaving them stuck in
-  `sending`.
+  deleted the moment it settles. A send that fails before anything is
+  transmitted -- its claim refused because the account was just deleted, say --
+  hands its upload slots back instead of leaving them stuck in `sending`.
 - `DELETE /api/v1/accounts/{id}` is unchanged: it disables an account and keeps
   its data.
 

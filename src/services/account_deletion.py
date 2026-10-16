@@ -114,13 +114,18 @@ def _delete(db: Session, user_id: int, *, account_id: int, confirm_name: str | N
     # A send that has claimed but not settled would find its account gone
     # mid-flight: delivered, yet reported as failed. Let it finish first. A new
     # send cannot start meanwhile: its claim needs this row, which is locked.
+    #
+    # The bound is timezone-aware on purpose. created_at is the database's own
+    # now(), written in the session's TimeZone; PostgreSQL reads a naive column
+    # in that same zone when comparing it with an aware value, so this holds
+    # whatever TimeZone is set. A naive UTC bound would hold only under UTC.
     in_flight = db.scalar(
         select(func.count())
         .select_from(SendAudit)
         .where(
             SendAudit.smtp_config_id == account.id,
             SendAudit.status == "pending",
-            SendAudit.created_at >= datetime.now(timezone.utc).replace(tzinfo=None) - IN_FLIGHT_SEND_WINDOW,
+            SendAudit.created_at >= datetime.now(timezone.utc) - IN_FLIGHT_SEND_WINDOW,
         )
     )
 

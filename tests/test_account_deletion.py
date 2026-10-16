@@ -298,6 +298,7 @@ async def test_an_account_with_a_send_in_flight_is_not_deleted_until_it_settles(
     payload = json.loads(str(busy.value))
     assert payload["code"] == "CONFLICT"
     assert payload["details"] == {"retry_after": 30}
+    assert payload["retryable"] is True
     assert _inventory(Session, mailboxes["doomed"]) == before
 
     # A 'pending' left behind by a process that died mid-send must not block it forever.
