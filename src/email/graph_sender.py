@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from src.config import settings
+from src.email.draft_builder import serialize_for_wire
 from src.email.smtp_sender import OutboundCompositionError, compose_outbound_message
 from src.security.provider_tokens import ProviderAuthError, ProviderNotConfigured, access_token_for
 
@@ -144,7 +145,9 @@ class GraphMailSender:
             )
             if bcc_addresses:
                 msg["Bcc"] = ", ".join(bcc_addresses)
-            body = base64.b64encode(msg.as_bytes())
+            # CRLF, as on any wire. Exchange's MIME import -- the same one that
+            # misread the bare-LF soft breaks of drafts -- is what parses this.
+            body = base64.b64encode(serialize_for_wire(msg))
         except OutboundCompositionError:
             return {
                 "success": False,
