@@ -28,29 +28,33 @@ class GmailHistoryExpired(RuntimeError):
 
 
 class GmailRateLimited(RuntimeError):
-    """Gmail kept throttling this mailbox for longer than the caller can wait.
+    """Gmail kept throttling this mailbox for longer than the caller may wait.
 
-    ``fetched_messages`` counts the messages this client did fetch before giving
-    up, so a synchronization can tell a slow run from one that made no progress.
+    ``made_progress`` is set by a synchronization that committed work before the
+    throttle ended its run; the client cannot know what its caller committed.
     """
 
-    def __init__(self, retry_after: float, *, fetched_messages: int = 0):
+    def __init__(self, retry_after: float):
         self.retry_after = max(1.0, float(retry_after))
-        self.fetched_messages = fetched_messages
+        self.made_progress = False
         super().__init__(f"Gmail rate limit: retry in {math.ceil(self.retry_after)}s")
 
 
 class GmailApiClient:
     BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
     TRANSIENT_STATUSES = {500, 502, 503, 504}
-    # After a throttle, every request of this client waits behind one shared gate,
-    # backing off further on each fresh throttle, and from then on requests start
-    # one at a time at this spacing. A mailbox's per-user quota is enforced over
-    # seconds, so ten parallel fetches trip it where paced ones do not.
+    # Gmail enforces a mailbox's quota over seconds to a minute. A throttle starts
+    # a throttled period for this client: every request waits behind one shared
+    # gate -- 5 s, then 10, 20, 40 and 60 s for each further throttle of the
+    # period, or as long as Retry-After asks -- and between pauses requests start
+    # one at a time, ten a second (about half of a 6,000 units/minute quota). The
+    # period ends once PACE_HOLD_SECONDS pass after a pause without another
+    # throttle. No wait may run past the client's deadline.
     THROTTLE_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
-    PACED_INTERVAL_SECONDS = 0.25
     MIN_THROTTLE_PAUSE_SECONDS = 1.0
     MAX_RETRY_AFTER_SECONDS = 300.0
+    PACED_INTERVAL_SECONDS = 0.1
+    PACE_HOLD_SECONDS = 60.0
     # How long a caller without a deadline of its own (a tool call) may wait.
     INTERACTIVE_THROTTLE_BUDGET_SECONDS = 15.0
 
@@ -83,7 +87,7 @@ class GmailApiClient:
         self._paced = False
         self._pace_lock = asyncio.Lock()
         self._next_slot = 0.0
-        self.fetched_messages = 0
+        self._token_lock = asyncio.Lock()
         self.throttle_pauses: list[float] = []
 
     async def close(self) -> None:
@@ -91,11 +95,16 @@ class GmailApiClient:
             await self._client.aclose()
 
     async def _token(self) -> str:
-        if not self._access_token:
-            self._access_token = await asyncio.to_thread(
-                refresh_access_token, self.config.credential_ciphertext
-            )
-        return self._access_token
+        # One refresh at a time: a chunk of parallel requests would otherwise each
+        # ask Google's token endpoint for a token of its own.
+        if self._access_token:
+            return self._access_token
+        async with self._token_lock:
+            if not self._access_token:
+                self._access_token = await asyncio.to_thread(
+                    refresh_access_token, self.config.credential_ciphertext
+                )
+            return self._access_token
 
     @staticmethod
     def _is_throttle(response: httpx.Response) -> bool:
@@ -123,10 +132,10 @@ class GmailApiClient:
         return seconds if seconds is not None and math.isfinite(seconds) and seconds >= 0 else None
 
     def _rate_limited(self, now: float) -> GmailRateLimited:
-        return GmailRateLimited(self._gate_until - now, fetched_messages=self.fetched_messages)
+        return GmailRateLimited(self._gate_until - now)
 
     async def _admit(self) -> None:
-        """Wait until this client may send: past the throttle gate, and paced once throttled."""
+        """Wait until this client may send: past the gate, then on a paced slot while throttled."""
         while True:
             now = self._clock()
             if self._gate_until > now:
@@ -134,18 +143,30 @@ class GmailApiClient:
                     raise self._rate_limited(now)
                 await self._sleep(self._gate_until - now)
                 continue
+            if self._paced and now - self._gate_until >= self.PACE_HOLD_SECONDS:
+                # Quiet since the last pause ended: the throttled period is over.
+                self._paced = False
+                self._throttle_streak = 0
             if not self._paced:
                 return
             async with self._pace_lock:
-                now = self._clock()
-                if self._gate_until > now:
-                    continue
-                wait = self._next_slot - now
-                if wait > 0:
-                    await self._sleep(wait)
-                    continue
-                self._next_slot = now + self.PACED_INTERVAL_SECONDS
-                return
+                if await self._claim_paced_slot():
+                    return
+
+    async def _claim_paced_slot(self) -> bool:
+        """Wait, holding the pace lock, for this request's slot; False if the gate closed."""
+        while True:
+            now = self._clock()
+            if self._gate_until > now:
+                return False
+            slot = max(self._next_slot, now)
+            if slot > self._throttle_deadline:
+                raise self._rate_limited(now)
+            if slot > now:
+                await self._sleep(slot - now)
+                continue
+            self._next_slot = now + self.PACED_INTERVAL_SECONDS
+            return True
 
     def _note_throttle(self, response: httpx.Response, sent_at: float) -> None:
         """Close the gate for a fresh throttle; raise when the wait outlasts the deadline."""
@@ -186,18 +207,25 @@ class GmailApiClient:
         refreshed = False
         transient_attempts = 0
         while True:
+            # The token first: a refresh takes time, and the gate may close
+            # meanwhile. Nothing is awaited between admission and the send.
+            token = await self._token()
             await self._admit()
-            headers = {"Authorization": f"Bearer {await self._token()}"}
+            headers = {"Authorization": f"Bearer {token}"}
             sent_at = self._clock()
             if method == "GET":
                 response = await self._client.get(url, params=params, headers=headers)
+            elif method == "POST" and payload is not None:
+                response = await self._client.post(url, json=payload, headers=headers)
+            elif method == "POST":
+                response = await self._client.post(url, headers=headers)
             else:
-                response = await self._client.post(
-                    url, json=payload if payload is not None else {}, headers=headers
-                )
+                response = await self._client.request(method, url, headers=headers)
             if response.status_code == 401 and not refreshed:
                 refreshed = True
-                self._access_token = None
+                # Only the token this request used: another may already be fresh.
+                if self._access_token == token:
+                    self._access_token = None
                 continue
             if self._is_throttle(response):
                 self._note_throttle(response, sent_at)
@@ -208,8 +236,6 @@ class GmailApiClient:
                 transient_attempts += 1
                 await self._sleep(delay)
                 continue
-            if response.is_success:
-                self._throttle_streak = 0
             return response
 
     async def _request(
@@ -244,7 +270,9 @@ class GmailApiClient:
     async def list_history(
         self, start_history_id: str, *, page_token: str | None = None
     ) -> dict:
-        params = {"startHistoryId": start_history_id, "maxResults": 500}
+        # Small pages: a synchronization saves its place after each one, and a
+        # throttled run must be able to finish a page to make progress.
+        params = {"startHistoryId": start_history_id, "maxResults": 100}
         if page_token:
             params["pageToken"] = page_token
         return (
@@ -257,7 +285,7 @@ class GmailApiClient:
 
         Retrying a throttled POST is safe: Gmail refuses it before doing anything.
         """
-        response = await self._send("POST", path, payload=payload)
+        response = await self._send("POST", path, payload=payload if payload is not None else {})
         response.raise_for_status()
         # trash and delete answer 204 with no body.
         return response.json() if response.content else None
@@ -289,15 +317,9 @@ class GmailApiClient:
 
     async def delete_message_permanently(self, message_id: str) -> None:
         """Remove a message outright. There is no undo for this on Gmail's side."""
-        response = await self._client.post(
-            f"{self.BASE_URL}/messages/{message_id}/delete",
-            headers={"Authorization": f"Bearer {await self._token()}"},
-        )
+        response = await self._send("POST", f"messages/{message_id}/delete")
         if response.status_code == 405:
-            response = await self._client.delete(
-                f"{self.BASE_URL}/messages/{message_id}",
-                headers={"Authorization": f"Bearer {await self._token()}"},
-            )
+            response = await self._send("DELETE", f"messages/{message_id}")
         response.raise_for_status()
 
     async def create_draft(self, raw: bytes, *, thread_id: str | None = None) -> dict | None:
@@ -313,14 +335,11 @@ class GmailApiClient:
 
     async def get_message(self, message_id: str, *, raw: bool = True) -> dict | None:
         params = {"format": "raw" if raw else "metadata"}
-        message = await self._request(
+        return await self._request(
             f"messages/{message_id}",
             params=params,
             allow_missing=True,
         )
-        if message is not None:
-            self.fetched_messages += 1
-        return message
 
     async def get_parsed_message(self, message_id: str) -> dict | None:
         provider_message = await self.get_message(message_id)

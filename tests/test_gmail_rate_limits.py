@@ -12,10 +12,11 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.email import email_processor
+from src.email import email_processor, gmail_api_client
 from src.email.email_processor import EmailProcessor
 from src.email.gmail_api_client import GmailApiClient, GmailRateLimited
 from src.models.base import Base
+from src.models.email import EmailLog
 from src.models.smtp_config import SMTPConfig
 from src.models.user import User
 
@@ -63,7 +64,8 @@ def _client(handler, fake: FakeTime | None = None, **kwargs):
     if fake is not None:
         kwargs.setdefault("clock", fake.clock)
         kwargs.setdefault("sleep", fake.sleep)
-    return GmailApiClient(_config(), http_client=http_client, access_token="token", **kwargs), http_client
+    kwargs.setdefault("access_token", "token")
+    return GmailApiClient(_config(), http_client=http_client, **kwargs), http_client
 
 
 def _scripted(fake: FakeTime, *responses: httpx.Response):
@@ -90,7 +92,6 @@ async def test_a_throttled_fetch_waits_then_succeeds():
     assert message == {"id": "m1"}
     assert fake.sleeps == [5.0]
     assert sent[1] - sent[0] == 5.0
-    assert client.fetched_messages == 1
 
 
 @pytest.mark.asyncio
@@ -154,7 +155,7 @@ async def test_a_retry_after_of_zero_still_pauses():
 
 
 @pytest.mark.asyncio
-async def test_fresh_throttles_back_off_further_and_a_success_resets():
+async def test_pauses_grow_within_a_throttled_period_even_between_successes():
     fake = FakeTime()
     handler, _ = _scripted(
         fake,
@@ -172,9 +173,62 @@ async def test_fresh_throttles_back_off_further_and_a_success_resets():
     finally:
         await http_client.aclose()
 
-    assert client.throttle_pauses == [5.0, 10.0, 20.0, 5.0]
-    # Paced once throttled: the second fetch waits its slot before sending.
-    assert fake.sleeps == [5.0, 10.0, 20.0, 0.25, 5.0]
+    assert client.throttle_pauses == [5.0, 10.0, 20.0, 40.0]
+    # Paced once throttled: the second fetch waits for its slot first.
+    assert fake.sleeps == [5.0, 10.0, 20.0, 0.1, 40.0]
+
+
+@pytest.mark.asyncio
+async def test_the_throttled_period_ends_after_a_quiet_minute():
+    fake = FakeTime()
+    handler, _ = _scripted(
+        fake,
+        httpx.Response(403, json=THROTTLED),
+        httpx.Response(200, json={"id": "m1"}),
+        httpx.Response(403, json=THROTTLED),
+        httpx.Response(200, json={"id": "m2"}),
+        httpx.Response(200, json={"id": "m3"}),
+    )
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 600)
+    try:
+        await client.get_message("m1")
+        fake.now += GmailApiClient.PACE_HOLD_SECONDS + 1  # a quiet minute
+        await client.get_message("m2")
+        fake.now += GmailApiClient.PACE_HOLD_SECONDS + 1
+        await client.get_message("m3")
+    finally:
+        await http_client.aclose()
+
+    # The second period starts over at 5 s, and after it ends nothing is paced.
+    assert client.throttle_pauses == [5.0, 5.0]
+    assert fake.sleeps == [5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_paced_requests_stop_at_the_deadline():
+    fake = FakeTime()
+    deadline = fake.now + 5.95
+    sent: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(fake.now)
+        if len(sent) == 1:
+            return httpx.Response(403, json=THROTTLED)
+        return httpx.Response(200, json={"id": "m"})
+
+    client, http_client = _client(handler, fake, throttle_deadline=deadline)
+    try:
+        with pytest.raises(GmailRateLimited) as raised:
+            for _ in range(50):
+                await client.get_message("m")
+    finally:
+        await http_client.aclose()
+
+    # One throttle, then one request every 0.1 s from 1005.0 until a slot would
+    # fall past the deadline: ten, not the fifty asked for.
+    assert len(sent) == 11
+    assert max(sent) <= deadline
+    assert raised.value.retry_after == 1.0
 
 
 @pytest.mark.asyncio
@@ -194,28 +248,7 @@ async def test_it_gives_up_when_the_wait_would_outlast_the_deadline():
     # Waited 5s once; the next pause (10s) would end past the deadline.
     assert fake.sleeps == [5.0]
     assert raised.value.retry_after == 10.0
-    assert raised.value.fetched_messages == 0
-
-
-@pytest.mark.asyncio
-async def test_giving_up_reports_the_messages_already_fetched():
-    fake = FakeTime()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/m1"):
-            return httpx.Response(200, json={"id": "m1"})
-        return httpx.Response(403, json=THROTTLED)
-
-    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 3)
-    try:
-        await client.get_message("m1")
-        with pytest.raises(GmailRateLimited) as raised:
-            await client.get_message("m2")
-    finally:
-        await http_client.aclose()
-
-    assert raised.value.fetched_messages == 1
-    assert fake.sleeps == []
+    assert raised.value.made_progress is False
 
 
 @pytest.mark.asyncio
@@ -232,6 +265,88 @@ async def test_a_tool_call_waits_only_briefly():
     finally:
         await http_client.aclose()
     assert sum(fake.sleeps) <= GmailApiClient.INTERACTIVE_THROTTLE_BUDGET_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_token_refresh_does_not_carry_a_request_past_a_closed_gate():
+    fake = FakeTime()
+    handler, sent = _scripted(fake, httpx.Response(200, json={"id": "m1"}))
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
+    refreshes = 0
+
+    async def token():
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes == 1:
+            # Another request's throttle lands while this one fetches its token.
+            client._note_throttle(httpx.Response(403, json=THROTTLED), sent_at=fake.now)
+        return "token"
+
+    client._token = token
+    try:
+        await client.get_message("m1")
+    finally:
+        await http_client.aclose()
+    assert sent == [1005.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_answers_after", [0.0, 0.2])
+async def test_parallel_401s_refresh_the_token_once(monkeypatch, late_answers_after):
+    """At 0.0 every 401 needs a new token at once (one refresh, not five); at 0.2 four
+    401s for the old token arrive after the refresh and must not discard the new one."""
+    refreshed: list[str] = []
+
+    def refresh(ciphertext):
+        refreshed.append(ciphertext)
+        return "fresh"
+
+    monkeypatch.setattr(gmail_api_client, "refresh_access_token", refresh)
+    stale_seen = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal stale_seen
+        if request.headers["Authorization"] == "Bearer stale":
+            stale_seen += 1
+            # Every request is in flight with the stale token before any answer.
+            await asyncio.sleep(0.01 if stale_seen == 1 else 0.01 + late_answers_after)
+            return httpx.Response(401, json={})
+        return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1]})
+
+    client, http_client = _client(handler, access_token="stale")
+    try:
+        results = await asyncio.gather(*(client.get_message(f"m{n}") for n in range(5)))
+    finally:
+        await http_client.aclose()
+
+    assert stale_seen == 5
+    assert [r["id"] for r in results] == [f"m{n}" for n in range(5)]
+    assert refreshed == ["unused"]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_permanent_delete_waits_then_falls_back():
+    fake = FakeTime()
+    calls: list[tuple[str, str, int]] = []
+    answers = [
+        httpx.Response(403, json=THROTTLED),
+        httpx.Response(405, json={}),
+        httpx.Response(204),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        response = answers.pop(0)
+        calls.append((request.method, request.url.path.rsplit("/", 1)[-1], response.status_code))
+        return response
+
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
+    try:
+        await client.delete_message_permanently("m1")
+    finally:
+        await http_client.aclose()
+
+    assert calls == [("POST", "delete", 403), ("POST", "delete", 405), ("DELETE", "m1", 204)]
+    assert fake.sleeps[0] == 5.0
 
 
 @pytest.mark.asyncio
@@ -304,6 +419,13 @@ def sessions(tmp_path, monkeypatch):
     engine.dispose()
 
 
+def _account(sessions) -> SMTPConfig:
+    with sessions() as db:
+        account = db.get(SMTPConfig, 1)
+        db.expunge(account)
+        return account
+
+
 async def _run_throttled(sessions, monkeypatch, error: Exception) -> SMTPConfig:
     with sessions() as db:
         config = SMTPConfig.create_detached(db.get(SMTPConfig, 1))
@@ -311,16 +433,19 @@ async def _run_throttled(sessions, monkeypatch, error: Exception) -> SMTPConfig:
     processor.processing = True
     monkeypatch.setattr(processor, "_process_gmail_api", AsyncMock(side_effect=error))
     assert await processor._process_server(config, force=True) is False
-    with sessions() as db:
-        account = db.get(SMTPConfig, 1)
-        db.expunge(account)
-        return account
+    return _account(sessions)
+
+
+def _progressed(retry_after: float) -> GmailRateLimited:
+    error = GmailRateLimited(retry_after)
+    error.made_progress = True
+    return error
 
 
 @pytest.mark.asyncio
-async def test_a_throttled_run_that_fetched_mail_is_not_an_error(sessions, monkeypatch):
+async def test_a_throttled_run_that_made_progress_is_not_an_error(sessions, monkeypatch):
     before = datetime.now(timezone.utc)
-    account = await _run_throttled(sessions, monkeypatch, GmailRateLimited(42, fetched_messages=3))
+    account = await _run_throttled(sessions, monkeypatch, _progressed(42))
 
     assert account.sync_state == "backfilling"
     assert account.last_error_code == "PROVIDER_RATE_LIMITED"
@@ -331,15 +456,140 @@ async def test_a_throttled_run_that_fetched_mail_is_not_an_error(sessions, monke
 
 
 @pytest.mark.asyncio
-async def test_a_throttled_run_that_fetched_nothing_is_an_error(sessions, monkeypatch):
+async def test_a_throttled_run_without_progress_is_an_error(sessions, monkeypatch):
     before = datetime.now(timezone.utc)
-    account = await _run_throttled(sessions, monkeypatch, GmailRateLimited(900, fetched_messages=0))
+    account = await _run_throttled(sessions, monkeypatch, GmailRateLimited(900))
 
     assert account.sync_state == "error"
     assert account.last_error_code == "PROVIDER_RATE_LIMITED"
     assert account.consecutive_failures == 5
     # The usual backoff for a fifth failure is 480s; Gmail's longer wait wins.
     assert account.retry_at.replace(tzinfo=timezone.utc) >= before + timedelta(seconds=900)
+
+
+class FakeGmail:
+    """The Gmail calls a synchronization run makes, with throttles where asked."""
+
+    def __init__(self, ids, *, throttle=(), history=None):
+        self.ids = list(ids)
+        self.throttle = set(throttle)
+        self.history = history
+        self.fetched: list[str] = []
+        self.profile_calls = 0
+
+    async def get_profile(self):
+        self.profile_calls += 1
+        return {"historyId": "500", "messagesTotal": len(self.ids)}
+
+    async def list_messages(self, *, page_token=None, max_results=100):
+        return {"messages": [{"id": message_id} for message_id in self.ids]}
+
+    async def list_history(self, start_history_id, *, page_token=None):
+        return self.history
+
+    async def get_parsed_message(self, message_id):
+        if message_id in self.throttle:
+            raise GmailRateLimited(30)
+        self.fetched.append(message_id)
+        return {"provider_message_id": message_id}
+
+    async def close(self):
+        pass
+
+
+def _recording_processor(sessions, monkeypatch, gmail: FakeGmail) -> EmailProcessor:
+    processor = EmailProcessor()
+    processor.processing = True
+    monkeypatch.setattr(email_processor, "GmailApiClient", lambda config, **kwargs: gmail)
+
+    async def record(messages):
+        with sessions.begin() as db:
+            for message in messages:
+                row = (
+                    db.query(EmailLog)
+                    .filter_by(smtp_config_id=1, provider_message_id=message["provider_message_id"])
+                    .one_or_none()
+                )
+                if row is None:
+                    row = EmailLog(
+                        smtp_config_id=1,
+                        sender="a",
+                        recipient="b",
+                        subject="s",
+                        message_id=message["provider_message_id"],
+                        provider_message_id=message["provider_message_id"],
+                        email_date=datetime.now(timezone.utc),
+                    )
+                    db.add(row)
+                row.last_seen_sync_generation = message.get("last_seen_sync_generation")
+
+    processor._process_emails = record
+    return processor
+
+
+async def _sync(sessions, processor) -> bool:
+    with sessions() as db:
+        config = SMTPConfig.create_detached(db.get(SMTPConfig, 1))
+    return await processor._process_server(config, force=True)
+
+
+@pytest.mark.asyncio
+async def test_a_full_sync_cut_short_on_its_first_page_resumes_where_it_stopped(sessions, monkeypatch):
+    ids = [f"m{n}" for n in range(1, 6)]
+    first = FakeGmail(ids, throttle={"m4"})
+    assert await _sync(sessions, _recording_processor(sessions, monkeypatch, first)) is False
+
+    account = _account(sessions)
+    assert account.sync_state == "backfilling"
+    assert account.last_error_code == "PROVIDER_RATE_LIMITED"
+    assert account.consecutive_failures == 0
+    assert account.sync_page_token is None  # the page never finished
+    assert account.backfill_processed == 4
+
+    second = FakeGmail(ids)
+    assert await _sync(sessions, _recording_processor(sessions, monkeypatch, second)) is True
+
+    # Same generation, no new snapshot, and only the message the first run did not record.
+    assert second.profile_calls == 0
+    assert second.fetched == ["m4"]
+    account = _account(sessions)
+    assert account.sync_generation == 1
+    assert account.initial_sync_complete is True
+    assert account.sync_state == "healthy"
+    assert account.last_error_code is None
+    assert account.backfill_processed == 5
+    with sessions() as db:
+        rows = db.query(EmailLog).filter_by(smtp_config_id=1).all()
+        assert sorted(row.provider_message_id for row in rows) == ids
+        assert {row.last_seen_sync_generation for row in rows} == {1}
+        assert all(row.deleted_at is None for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_history_page_cut_short_is_not_progress(sessions, monkeypatch):
+    with sessions.begin() as db:
+        account = db.get(SMTPConfig, 1)
+        account.initial_sync_complete = True
+        account.backfill_complete = True
+        account.provider_sync_token = "500"
+    history = {"history": [{"messages": [{"id": "h1"}, {"id": "h2"}]}], "historyId": "600"}
+
+    gmail = FakeGmail([], throttle={"h2"}, history=history)
+    assert await _sync(sessions, _recording_processor(sessions, monkeypatch, gmail)) is False
+    # h1 was fetched, but the page is fetched again in full next time: no progress.
+    assert gmail.fetched == ["h1"]
+    account = _account(sessions)
+    assert account.sync_state == "error"
+    assert account.last_error_code == "PROVIDER_RATE_LIMITED"
+    assert account.consecutive_failures == 5
+    assert account.provider_sync_token == "500"
+
+    gmail = FakeGmail([], history=history)
+    assert await _sync(sessions, _recording_processor(sessions, monkeypatch, gmail)) is True
+    account = _account(sessions)
+    assert account.provider_sync_token == "600"
+    assert account.sync_state == "healthy"
+    assert account.consecutive_failures == 0
 
 
 @pytest.mark.asyncio
@@ -351,26 +601,52 @@ async def test_a_chunk_keeps_what_arrived_and_waits_for_every_fetch(monkeypatch)
 
     async def get_parsed_message(message_id):
         if message_id == "two":
-            raise GmailRateLimited(30, fetched_messages=1)
+            raise GmailRateLimited(30)
         await asyncio.sleep(0.02 if message_id == "three" else 0)
         finished.append(message_id)
         return {"provider_message_id": message_id}
 
     processor = EmailProcessor()
     processor._process_emails = AsyncMock()
+    committed = []
+
+    async def on_committed(count):
+        committed.append(count)
+
     with pytest.raises(GmailRateLimited):
         await processor._fetch_and_process_gmail_messages(
-            SimpleNamespace(get_parsed_message=get_parsed_message), ["one", "two", "three", "four"]
+            SimpleNamespace(get_parsed_message=get_parsed_message),
+            ["one", "two", "three", "four"],
+            on_committed=on_committed,
         )
 
     assert sorted(finished) == ["one", "three"]
     processor._process_emails.assert_awaited_once()
     assert [m["provider_message_id"] for m in processor._process_emails.await_args.args[0]] == ["one", "three"]
+    assert committed == [2]
 
 
-def test_the_run_stops_waiting_before_its_job_deadline():
+@pytest.mark.asyncio
+async def test_a_processing_failure_keeps_the_throttle_as_its_cause():
+    async def get_parsed_message(message_id):
+        if message_id == "two":
+            raise GmailRateLimited(30)
+        return {"provider_message_id": message_id}
+
+    processor = EmailProcessor()
+    processor._process_emails = AsyncMock(side_effect=RuntimeError("database gone"))
+    with pytest.raises(RuntimeError) as raised:
+        await processor._fetch_and_process_gmail_messages(
+            SimpleNamespace(get_parsed_message=get_parsed_message), ["one", "two"]
+        )
+    assert isinstance(raised.value.__cause__, GmailRateLimited)
+
+
+def test_the_run_stops_waiting_well_before_its_job_deadline():
     processor = EmailProcessor()
     processor.job_deadline = 5000.0
+    # Longer than one request may take (httpx's 30 s timeout), with room to commit.
+    assert EmailProcessor.GMAIL_THROTTLE_MARGIN_SECONDS >= 45
     assert processor._gmail_throttle_deadline() == 5000.0 - EmailProcessor.GMAIL_THROTTLE_MARGIN_SECONDS
 
 
@@ -388,6 +664,9 @@ async def test_the_worker_hands_its_deadline_to_the_run(sessions, monkeypatch):
     deadline = time.monotonic() + 30
     assert await sync_worker.run_account(1, "worker-token", deadline) == 0
     assert seen == [deadline]
+
+
+# ---- tool calls
 
 
 @pytest.mark.asyncio
@@ -415,3 +694,86 @@ async def test_a_tool_call_reports_gmail_throttling_as_retryable(monkeypatch):
         await write_service._gmail(None, account, operation)
     assert raised.value.status_code == 429
     assert raised.value.detail["retry_after"] == 13
+
+
+class _Db:
+    def __init__(self):
+        self.deleted = []
+        self.commits = 0
+
+    def delete(self, row):
+        self.deleted.append(row)
+
+    def commit(self):
+        self.commits += 1
+
+
+def _gmail_messages():
+    return [SimpleNamespace(id=n, provider_message_id=f"g{n}", flags='["INBOX"]', deleted_at=None) for n in (1, 2, 3)]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_relabel_records_what_gmail_applied(monkeypatch):
+    from src.services import write_service
+
+    recorded = []
+    monkeypatch.setattr(write_service, "_record_gmail_labels", lambda db, message, labels: recorded.append(message.id))
+
+    class Client:
+        async def modify_labels(self, message_id, *, add, remove):
+            if message_id == "g2":
+                raise GmailRateLimited(9)
+            return sorted(["INBOX", *add])
+
+    async def fake_gmail(db, account, operation):
+        return await operation(Client())
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    messages = _gmail_messages()
+    selection = SimpleNamespace(account=SimpleNamespace(id=5), targets=[(m, None) for m in messages], skipped=[])
+    db = _Db()
+    with pytest.raises(HTTPException) as raised:
+        await write_service._gmail_relabel(
+            db, selection, add_for=lambda labels: ["STARRED"], remove_for=lambda labels: []
+        )
+
+    assert sorted(recorded) == [1, 3]
+    assert db.commits == 1
+    assert raised.value.status_code == 429
+    assert raised.value.detail["retry_after"] == 9
+    assert "2 of 3 changes were applied" in raised.value.detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_permanent_delete_records_what_gmail_removed(monkeypatch):
+    from src.services import write_service
+
+    messages = _gmail_messages()
+    placements = {m.id: SimpleNamespace(folder="[Gmail]/Trash") for m in messages}
+    selection = SimpleNamespace(
+        account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
+        targets=[(m, placements[m.id]) for m in messages],
+        skipped=[],
+        matched=3,
+    )
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
+
+    class Client:
+        async def delete_message_permanently(self, message_id):
+            if message_id == "g2":
+                raise GmailRateLimited(20)
+
+    async def fake_gmail(db, account, operation):
+        return await operation(Client())
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    db = _Db()
+    with pytest.raises(HTTPException) as raised:
+        await write_service.delete_mail(db, SimpleNamespace(id=1), permanent=True, email_ids=[1, 2, 3])
+
+    assert db.deleted == [placements[1], placements[3]]
+    assert [m.deleted_at is not None for m in messages] == [True, False, True]
+    assert db.commits == 1
+    assert raised.value.status_code == 429
+    assert "2 of 3 changes were applied" in raised.value.detail["message"]

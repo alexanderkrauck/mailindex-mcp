@@ -542,14 +542,26 @@ async def delete_mail(
                 async with semaphore:
                     await client.delete_message_permanently(message.provider_message_id)
 
-            await asyncio.gather(*(one(message) for message, _p in selection.targets))
+            # Every deletion settles, so the ones Gmail did are recorded even
+            # when another was throttled or refused.
+            return await asyncio.gather(
+                *(one(message) for message, _p in selection.targets), return_exceptions=True
+            )
 
-        await _gmail(db, selection.account, destroy)
+        results = await _gmail(db, selection.account, destroy)
         now = datetime.now(tz=timezone.utc)
-        for message, placement in selection.targets:
+        removed = 0
+        failure: BaseException | None = None
+        for (message, placement), result in zip(selection.targets, results, strict=True):
+            if isinstance(result, BaseException):
+                failure = failure or result
+                continue
             db.delete(placement)
             message.deleted_at = now
+            removed += 1
         db.commit()
+        if failure is not None:
+            _raise_gmail_failure(failure, applied=removed, total=len(results))
         return _outcome(selection, limit, permanent=True)
 
     if permanent:
@@ -932,6 +944,37 @@ def _is_gmail_api(account: SMTPConfig) -> bool:
     return account.provider == "gmail" and account.auth_type == "oauth2"
 
 
+def _gmail_failure(exc: BaseException, *, applied: int | None = None, total: int | None = None) -> BaseException:
+    """The HTTPException a tool call answers with for a Gmail failure; others unchanged."""
+    from src.email.gmail_api_client import GmailRateLimited
+
+    done = f" {applied} of {total} changes were applied and recorded." if applied is not None else ""
+    if isinstance(exc, GmailRateLimited):
+        return HTTPException(
+            status_code=429,
+            detail={
+                "message": f"Gmail is rate-limiting this mailbox.{done} Retry shortly to continue.",
+                "retry_after": math.ceil(exc.retry_after),
+            },
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        return HTTPException(
+            status_code=502,
+            detail=(
+                f"Gmail refused the change: {exc.response.status_code} {exc.response.text[:200]}"
+                + (f".{done}" if done else "")
+            ),
+        )
+    return exc
+
+
+def _raise_gmail_failure(failure: BaseException, *, applied: int, total: int):
+    mapped = _gmail_failure(failure, applied=applied, total=total)
+    if mapped is failure:
+        raise failure
+    raise mapped from failure
+
+
 async def _gmail(db: Session, account: SMTPConfig, operation):
     """Run an operation against the Gmail API under the mailbox lease.
 
@@ -966,19 +1009,8 @@ async def _gmail(db: Session, account: SMTPConfig, operation):
     client = GmailApiClient(SMTPConfig.create_detached(account))
     try:
         return await operation(client)
-    except GmailRateLimited as exc:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "message": "Gmail is rate-limiting this mailbox; retry shortly",
-                "retry_after": math.ceil(exc.retry_after),
-            },
-        ) from exc
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gmail refused the change: {exc.response.status_code} {exc.response.text[:200]}",
-        ) from exc
+    except (GmailRateLimited, httpx.HTTPStatusError) as exc:
+        raise _gmail_failure(exc) from exc
     finally:
         keepalive.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1015,17 +1047,27 @@ async def _gmail_relabel(
             )
 
     async def operation(client):
+        # Every change settles before this returns, so the ones Gmail applied are
+        # recorded even when another was throttled or refused.
         return await asyncio.gather(
-            *(one(client, message) for message, _placement in selection.targets)
+            *(one(client, message) for message, _placement in selection.targets),
+            return_exceptions=True,
         )
 
     results = await _gmail(db, selection.account, operation)
     changed = 0
-    for message, labels in results:
+    failure: BaseException | None = None
+    for result in results:
+        if isinstance(result, BaseException):
+            failure = failure or result
+            continue
+        message, labels = result
         if labels is None:
             selection.skipped.append({"email_id": message.id, "reason": "Gmail did not confirm"})
             continue
         _record_gmail_labels(db, message, labels)
         changed += 1
     db.commit()
+    if failure is not None:
+        _raise_gmail_failure(failure, applied=changed, total=len(results))
     return changed

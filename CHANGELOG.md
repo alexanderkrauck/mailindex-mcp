@@ -6,23 +6,36 @@ Notable changes. Dates are release dates; the git history is finer grained.
 
 ### Gmail throttling slows a synchronization down instead of failing it
 
-- Gmail enforces each mailbox's quota over seconds and answers with 403
-  `rateLimitExceeded` (or 429) once it is used up. The client did not retry the
-  403 at all: during a catch-up, ten parallel fetches used up the quota, the run
-  failed, and the account showed `error` / `PROVIDER_SYNC_FAILED` until a
+- Gmail enforces each mailbox's quota over seconds to a minute and answers with
+  403 `rateLimitExceeded` (or 429) once it is used up. The client did not retry
+  the 403 at all: during a catch-up, ten parallel fetches used up the quota, the
+  run failed, and the account showed `error` / `PROVIDER_SYNC_FAILED` until a
   retry minutes later used it up again.
-- Now a throttle closes one gate for every request of that client. They wait
-  5 s, then 10, 20, 40 and 60 s on each further throttle (or as long as a
-  `Retry-After` asks, up to 5 minutes), and from then on start one at a time,
-  four per second. Answers to requests that were already in flight when the gate
-  closed do not lengthen the wait. Any other 403 is still final.
-- A synchronization waits only within its job's deadline. When the wait would
-  run past it, the run stops and records how far it got. An account that fetched
-  mail in that run stays `backfilling` (or `healthy`), with `last_error_code`
-  `PROVIDER_RATE_LIMITED`, a `retry_at`, and its failure count reset; only a run
-  that fetched nothing counts as a failure.
-- A tool call (a label change, a draft, an attachment fetch) waits at most 15
-  seconds, then answers `RATE_LIMITED` with `retry_after`.
+- Now a throttle starts a throttled period for that client. Every request waits
+  behind one shared pause: 5 s, then 10, 20, 40 and 60 s for each further
+  throttle in the period, or as long as a `Retry-After` asks (1 s to 5 minutes).
+  Between pauses, requests start one at a time, ten a second. The period ends
+  once a minute passes after a pause without another throttle. Answers to
+  requests that were already in flight when a pause began do not lengthen it.
+  Any other 403 is still final.
+- A synchronization never waits past its job's deadline, less a minute: no
+  pause and no paced slot may end later. When one would, the run stops, keeps
+  what it fetched, and records where it stopped. A run that committed work
+  (messages newly recorded for a full sync, or a saved checkpoint) stays
+  `backfilling` (or `healthy`) with `last_error_code` `PROVIDER_RATE_LIMITED`,
+  a `retry_at` and its failure count reset. A run that committed nothing counts
+  as a failure, retried no sooner than Gmail asked.
+- A full sync cut short resumes where it stopped. It no longer starts a new
+  generation when its first page did not finish, and it skips the messages it
+  already recorded on a page it is repeating. History is read in pages of 100
+  rather than 500 changes, so a throttled run can finish one and save its place.
+- A tool call (a label change, a move to Trash, a permanent deletion, a draft, an
+  attachment fetch) waits at most 15 seconds, then answers `RATE_LIMITED` with
+  `retry_after`. Label changes and permanent deletions Gmail did apply before
+  that are recorded in the index, and the answer says how many.
+- Permanent deletion now goes through the same throttle handling and token
+  refresh as every other Gmail call. Parallel requests that need a new access
+  token share one refresh.
 - A chunk of parallel fetches now lets every fetch finish, and keeps the messages
   that arrived, before it re-raises a failure.
 
