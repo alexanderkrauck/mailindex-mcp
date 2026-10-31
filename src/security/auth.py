@@ -71,9 +71,9 @@ def build_mcp_auth_provider():
 
     apply_fastmcp_cimd_token_audience_fix()
 
-    from fastmcp.server.auth.providers.google import GoogleProvider
+    from src.security.google_oauth import McpGoogleProvider
 
-    _mcp_auth_provider = GoogleProvider(
+    _mcp_auth_provider = McpGoogleProvider(
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
         base_url=settings.public_base_url.rstrip("/"),
