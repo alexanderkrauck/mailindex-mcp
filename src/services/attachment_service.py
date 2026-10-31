@@ -1,13 +1,14 @@
 """Owner-checked ephemeral attachment retrieval."""
 
 import hashlib
+import math
 from email import message_from_bytes, policy
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from src.email.attachment_handler import AttachmentHandler
-from src.email.gmail_api_client import GmailApiClient
+from src.email.gmail_api_client import GmailApiClient, GmailRateLimited
 from src.email.smtp_client import SMTPClient
 from src.models.attachment import EmailAttachment
 from src.models.email import EmailLog
@@ -58,6 +59,14 @@ async def refetch_attachment_bytes(
         gmail_client = GmailApiClient(account)
         try:
             raw_email = await gmail_client.get_raw_message(message.provider_message_id)
+        except GmailRateLimited as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": "Gmail is rate-limiting this mailbox; retry shortly",
+                    "retry_after": math.ceil(exc.retry_after),
+                },
+            ) from exc
         finally:
             await gmail_client.close()
         if raw_email is None:

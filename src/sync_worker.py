@@ -34,6 +34,7 @@ async def run_account(account_id: int, token: str, deadline: float) -> int:
 
     processor = EmailProcessor()
     processor.processing = True
+    processor.job_deadline = deadline
     processor._active_lock_tokens[account_id] = token
     result = 1
     try:

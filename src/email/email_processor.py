@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import logging
+import math
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import List
@@ -11,7 +13,7 @@ from sqlalchemy import func, or_
 
 from src.database.connection import SessionLocal, get_db_session
 from src.email import sanitize_db_text
-from src.email.gmail_api_client import GmailApiClient, GmailHistoryExpired
+from src.email.gmail_api_client import GmailApiClient, GmailHistoryExpired, GmailRateLimited
 from src.email.message_flags import apply_flag_state, normalize_flags
 from src.email.smtp_client import SMTPClient
 from src.email.text_extractor import TextExtractor
@@ -345,10 +347,16 @@ def reap_tombstoned_messages(db, *, config_id: int, now: datetime | None = None)
 class EmailProcessor:
     """Main email processing orchestrator."""
 
+    # Throttle waits stop this long before the job's deadline, leaving time to
+    # record where the run stopped while its lease still fences the writes.
+    GMAIL_THROTTLE_MARGIN_SECONDS = 20.0
+
     def __init__(self):
         self.active_clients = {}
         self.processing = False
         self._active_lock_tokens = {}
+        # The supervised job's monotonic work deadline, set by the sync worker.
+        self.job_deadline: float | None = None
 
     async def start_processing(self):
         """Start the email processing loop."""
@@ -500,16 +508,29 @@ class EmailProcessor:
                     config_id,
                 )
                 return False
-            failures = max(1, int(getattr(config, "consecutive_failures", 0) or 0) + 1)
-            retry_seconds = min(3600, 30 * (2 ** min(failures - 1, 7)))
-            self._mark_sync_failure(config_id, e, failures, retry_seconds)
-            logger.error(
-                "Error processing server %s: %s: %r; retrying in %ss",
-                getattr(config, "name", "unknown"),
-                type(e).__name__,
-                e,
-                retry_seconds,
-            )
+            if isinstance(e, GmailRateLimited) and e.fetched_messages:
+                # Throttled, but this run fetched mail: slow progress, not a failure.
+                retry_seconds = max(30, math.ceil(e.retry_after))
+                self._mark_sync_throttled(config_id, retry_seconds)
+                logger.warning(
+                    "Gmail is rate-limiting account %s after %s messages this run; continuing in %ss",
+                    config_id,
+                    e.fetched_messages,
+                    retry_seconds,
+                )
+            else:
+                failures = max(1, int(getattr(config, "consecutive_failures", 0) or 0) + 1)
+                retry_seconds = min(3600, 30 * (2 ** min(failures - 1, 7)))
+                if isinstance(e, GmailRateLimited):
+                    retry_seconds = max(retry_seconds, math.ceil(e.retry_after))
+                self._mark_sync_failure(config_id, e, failures, retry_seconds)
+                logger.error(
+                    "Error processing server %s: %s: %r; retrying in %ss",
+                    getattr(config, "name", "unknown"),
+                    type(e).__name__,
+                    e,
+                    retry_seconds,
+                )
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
@@ -643,6 +664,20 @@ class EmailProcessor:
             account.retry_at = None
 
     @staticmethod
+    def _mark_sync_throttled(config_id: int, retry_seconds: int) -> None:
+        """Gmail slowed this mailbox down while the run still made progress."""
+        now = datetime.now(tz=timezone.utc)
+        with SessionLocal.begin() as db:
+            account = db.query(SMTPConfig).filter(SMTPConfig.id == config_id).one()
+            account.sync_state = "healthy" if account.backfill_complete else "backfilling"
+            account.last_error_code = "PROVIDER_RATE_LIMITED"
+            account.last_error_message = (
+                f"Gmail is rate-limiting this mailbox; synchronization continues in {retry_seconds}s"
+            )
+            account.consecutive_failures = 0
+            account.retry_at = now + timedelta(seconds=retry_seconds)
+
+    @staticmethod
     def _mark_sync_interrupted(config_id: int) -> None:
         with SessionLocal.begin() as db:
             account = db.query(SMTPConfig).filter(SMTPConfig.id == config_id).one()
@@ -673,9 +708,17 @@ class EmailProcessor:
                 synchronize_session=False,
             )
 
+    def _gmail_throttle_deadline(self) -> float:
+        from src.config import settings
+
+        deadline = self.job_deadline
+        if deadline is None:
+            deadline = time.monotonic() + settings.sync_job_timeout_seconds
+        return deadline - self.GMAIL_THROTTLE_MARGIN_SECONDS
+
     async def _process_gmail_api(self, config: SMTPConfig) -> None:
         """Use Gmail history checkpoints for OAuth-backed Gmail accounts."""
-        client = GmailApiClient(config)
+        client = GmailApiClient(config, throttle_deadline=self._gmail_throttle_deadline())
         try:
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
@@ -816,11 +859,19 @@ class EmailProcessor:
         missing: set[str] = set()
         for offset in range(0, len(message_ids), concurrency):
             chunk_ids = message_ids[offset : offset + concurrency]
+            # Let every fetch of the chunk settle, so none is left running
+            # unobserved, and keep what arrived before re-raising a failure.
             fetched = await asyncio.gather(
-                *(client.get_parsed_message(message_id) for message_id in chunk_ids)
+                *(client.get_parsed_message(message_id) for message_id in chunk_ids),
+                return_exceptions=True,
             )
             messages = []
+            failure: BaseException | None = None
             for message_id, message in zip(chunk_ids, fetched, strict=True):
+                if isinstance(message, BaseException):
+                    if failure is None:
+                        failure = message
+                    continue
                 if message is None:
                     missing.add(message_id)
                     continue
@@ -829,6 +880,8 @@ class EmailProcessor:
                 messages.append(message)
             await self._process_emails(messages)
             processed_count += len(messages)
+            if failure is not None:
+                raise failure
         return processed_count, missing
 
     @staticmethod

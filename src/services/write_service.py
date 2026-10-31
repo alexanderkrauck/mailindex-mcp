@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -938,7 +939,7 @@ async def _gmail(db: Session, account: SMTPConfig, operation):
     renumber -- but the Gmail sync reconciles by history id, and a relabel landing
     mid-pass is still a change the pass did not see.
     """
-    from src.email.gmail_api_client import GmailApiClient
+    from src.email.gmail_api_client import GmailApiClient, GmailRateLimited
 
     deadline = datetime.now(tz=timezone.utc) + timedelta(
         seconds=settings.mail_write_lease_wait_seconds
@@ -965,6 +966,14 @@ async def _gmail(db: Session, account: SMTPConfig, operation):
     client = GmailApiClient(SMTPConfig.create_detached(account))
     try:
         return await operation(client)
+    except GmailRateLimited as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Gmail is rate-limiting this mailbox; retry shortly",
+                "retry_after": math.ceil(exc.retry_after),
+            },
+        ) from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
