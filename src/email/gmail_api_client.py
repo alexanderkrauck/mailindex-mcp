@@ -319,14 +319,41 @@ class GmailApiClient:
         result = await self._post(f"messages/{message_id}/trash") or {}
         return sorted(str(label) for label in result.get("labelIds", []))
 
+    @staticmethod
+    def _is_gone(response: httpx.Response) -> bool:
+        """Gmail's own answer that a message does not exist.
+
+        Not any 404: Google's front end answers a route that does not exist with
+        an HTML 404, and taking that for "already deleted" would record deletions
+        that never happened.
+        """
+        if response.status_code != 404:
+            return False
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        error = body.get("error") if isinstance(body, dict) else None
+        return isinstance(error, dict) and error.get("code") == 404
+
+    async def get_labels(self, message_id: str) -> list[str] | None:
+        """The labels a message carries now, or None when Gmail no longer has it."""
+        response = await self._send("GET", f"messages/{message_id}", params={"format": "minimal"})
+        if self._is_gone(response):
+            return None
+        response.raise_for_status()
+        return sorted(str(label) for label in response.json().get("labelIds", []))
+
     async def delete_message_permanently(self, message_id: str) -> None:
         """Remove a message outright. There is no undo for this on Gmail's side.
 
         Gmail's route is DELETE messages/{id}; there is no POST .../delete (it
-        answers 404). A message Gmail no longer has is already what was asked for.
+        answers 404). Gmail deletes whatever labels the message carries, so the
+        caller checks where it is first. A message Gmail no longer has is already
+        what was asked for.
         """
         response = await self._send("DELETE", f"messages/{message_id}")
-        if response.status_code == 404:
+        if self._is_gone(response):
             return
         response.raise_for_status()
 

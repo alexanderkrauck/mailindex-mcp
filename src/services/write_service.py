@@ -540,7 +540,16 @@ async def delete_mail(
 
             async def one(message):
                 async with semaphore:
+                    # Gmail deletes a message whatever its labels say, and the
+                    # index can be behind Gmail: a message restored from the Bin
+                    # there must not be destroyed here. So read where it is now.
+                    labels = await client.get_labels(message.provider_message_id)
+                    if labels is None:
+                        return None  # Gmail no longer has it
+                    if not is_excluded_folder(location_for(labels), suffixes):
+                        return labels
                     await client.delete_message_permanently(message.provider_message_id)
+                    return None
 
             # Every deletion settles, so the ones Gmail did are recorded even
             # when another was throttled or refused.
@@ -551,15 +560,25 @@ async def delete_mail(
         results = await _gmail(db, selection.account, destroy)
         now = datetime.now(tz=timezone.utc)
         removed = 0
+        left_in_place: set[int] = set()
         failure: BaseException | None = None
         for (message, placement), result in zip(selection.targets, results, strict=True):
             if isinstance(result, BaseException):
                 failure = failure or result
                 continue
+            if result is not None:
+                # Moved out of the Bin or Spam in Gmail: record where it is now.
+                _record_gmail_labels(db, message, result)
+                left_in_place.add(message.id)
+                selection.skipped.append(
+                    {"email_id": message.id, "reason": "no longer in Trash or Spam in Gmail; left in place"}
+                )
+                continue
             db.delete(placement)
             message.deleted_at = now
             removed += 1
         db.commit()
+        selection.targets = [target for target in selection.targets if target[0].id not in left_in_place]
         if failure is not None:
             _raise_gmail_failure(failure, done=f"{removed} of {len(results)} messages were deleted permanently.")
         return _outcome(selection, limit, permanent=True)

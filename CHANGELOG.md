@@ -28,9 +28,13 @@ Notable changes. Dates are release dates; the git history is finer grained.
 - A full sync cut short resumes where it stopped. It no longer starts a new
   generation when its first page did not finish, and it skips the messages it
   already recorded on a page it is repeating. History is read in pages of 100
-  rather than 500 changes, and after a run a throttle ended before it finished a
-  page, in pages half as large for each such run, so a throttled run can finish
-  one and save its place.
+  rather than 500 changes. While throttles keep ending runs before a page is
+  done, each next run asks for pages half as large (halved for every
+  consecutive failed run, down to one change), so one can finish and save its
+  place; a run that saves its place returns to full pages.
+- A synchronization error from one of Gmail's HTTP answers is classified by its
+  status, not by words in its text. The text includes the request URL, so a 500
+  for a message whose id happened to contain "429" showed as rate limiting.
 - A tool call (a label change, a move to Trash, a permanent deletion, a draft, an
   attachment fetch) waits at most 15 seconds, then answers `RATE_LIMITED` with
   `retry_after`: the remaining pause, or once paced requests run out of time,
@@ -47,8 +51,13 @@ Notable changes. Dates are release dates; the git history is finer grained.
   `POST messages/{id}/delete`, a route Gmail does not have (it answers 404), and
   fell back to Gmail's real route, `DELETE messages/{id}`, only on a 405 that
   never came. It now calls `DELETE` directly, through the same throttle handling
-  and token refresh as every other Gmail call, and a message Gmail no longer has
-  counts as deleted.
+  and token refresh as every other Gmail call.
+- Gmail deletes a message whatever its labels are, and the index can be behind
+  Gmail. So each message's labels are read from Gmail first: one that is no
+  longer in the Bin or Spam there (restored since the index last saw it) is
+  left alone, its new place is recorded, and the answer lists it as skipped.
+- A message Gmail no longer has counts as deleted. Any other refusal stays an
+  error, including a 404 that is not Gmail's own "not found".
 
 ## v0.3.2 — 2026-10-31
 

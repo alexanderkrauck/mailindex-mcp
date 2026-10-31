@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List
 
+import httpx
 from sqlalchemy import func, or_
 
 from src.database.connection import SessionLocal, get_db_session
@@ -362,6 +363,18 @@ class EmailProcessor:
     GMAIL_THROTTLE_MARGIN_SECONDS = 60.0
     GMAIL_HISTORY_PAGE_SIZE = 100
 
+    @classmethod
+    def _history_page_size(cls, last_error_code: str | None, consecutive_failures: int | None) -> int:
+        """Smaller history pages while throttles keep ending runs before a page is done.
+
+        Halved for each consecutive failed run when the last failure was a
+        throttle, down to one change; full size again once a run saves its place,
+        which resets the failure count.
+        """
+        if last_error_code != "PROVIDER_RATE_LIMITED":
+            return cls.GMAIL_HISTORY_PAGE_SIZE
+        return max(1, cls.GMAIL_HISTORY_PAGE_SIZE >> min(consecutive_failures or 0, 7))
+
     def __init__(self):
         self.active_clients = {}
         self.processing = False
@@ -561,7 +574,19 @@ class EmailProcessor:
     def _sync_error(exc: Exception) -> tuple[str, str]:
         message = str(exc).replace("\n", " ").strip()[:500]
         lowered = message.lower()
-        if "auth" in lowered or "login" in lowered:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        if isinstance(exc, GmailRateLimited) or status == 429:
+            code = "PROVIDER_RATE_LIMITED"
+        elif status is not None:
+            # An HTTP answer is classified by its status, not its text: the text
+            # carries the request URL, whose message ids can contain "429".
+            if status == 401:
+                code = "ACCOUNT_AUTH_FAILED"
+            elif status in (408, 504):
+                code = "PROVIDER_TIMEOUT"
+            else:
+                code = "PROVIDER_SYNC_FAILED"
+        elif "auth" in lowered or "login" in lowered:
             code = "ACCOUNT_AUTH_FAILED"
         elif "timeout" in lowered or "timed out" in lowered:
             code = "PROVIDER_TIMEOUT"
@@ -856,11 +881,7 @@ class EmailProcessor:
             progress = _GmailRunProgress()
         with get_db_session() as db:
             account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
-            page_size = self.GMAIL_HISTORY_PAGE_SIZE
-            if account.last_error_code == "PROVIDER_RATE_LIMITED":
-                # Runs a throttle ended before they finished a page: ask for
-                # smaller pages, halving per failed run, until one finishes.
-                page_size = max(1, page_size >> min(account.consecutive_failures or 0, 7))
+            page_size = self._history_page_size(account.last_error_code, account.consecutive_failures)
         for _ in range(settings.gmail_history_pages_per_cycle):
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()

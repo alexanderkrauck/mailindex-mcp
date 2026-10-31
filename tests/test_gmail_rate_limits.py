@@ -207,12 +207,12 @@ async def test_the_throttled_period_ends_after_a_quiet_minute():
 @pytest.mark.asyncio
 async def test_paced_requests_stop_at_the_deadline():
     fake = FakeTime()
-    deadline = fake.now + 5.95
+    deadline = fake.now + 15.95
     sent: list[float] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         sent.append(fake.now)
-        if len(sent) == 1:
+        if len(sent) in (1, 3):
             return httpx.Response(403, json=THROTTLED)
         return httpx.Response(200, json={"id": "m"})
 
@@ -224,12 +224,14 @@ async def test_paced_requests_stop_at_the_deadline():
     finally:
         await http_client.aclose()
 
-    # One throttle, then one request every 0.1 s from 1005.0 until a slot would
-    # fall past the deadline: ten, not the fifty asked for.
-    assert len(sent) == 11
+    # Throttled at 1000.0 (5 s) and at 1005.1 (10 s); then one request every
+    # 0.1 s from 1015.1 until a slot would fall past the deadline: twelve in all,
+    # not the fifty asked for.
+    assert client.throttle_pauses == [5.0, 10.0]
+    assert len(sent) == 12
     assert max(sent) <= deadline
     # Come back after as long as the quota last needed, not straight away.
-    assert raised.value.retry_after == 5.0
+    assert raised.value.retry_after == 10.0
 
 
 @pytest.mark.asyncio
@@ -333,7 +335,7 @@ async def test_a_throttled_permanent_delete_waits_then_deletes():
 
     async def handler(request: httpx.Request) -> httpx.Response:
         response = answers.pop(0)
-        calls.append((request.method, request.url.path.rsplit("/", 1)[-1], response.status_code))
+        calls.append((request.method, request.url.path, response.status_code))
         return response
 
     client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
@@ -343,7 +345,8 @@ async def test_a_throttled_permanent_delete_waits_then_deletes():
         await http_client.aclose()
 
     # Gmail's route is DELETE messages/{id}; it has no POST messages/{id}/delete.
-    assert calls == [("DELETE", "m1", 403), ("DELETE", "m1", 204)]
+    path = "/gmail/v1/users/me/messages/m1"
+    assert calls == [("DELETE", path, 403), ("DELETE", path, 204)]
     assert fake.sleeps == [5.0]
 
 
@@ -357,6 +360,57 @@ async def test_a_permanent_delete_of_a_message_gmail_no_longer_has_succeeds():
     finally:
         await http_client.aclose()
     assert len(sent) == 1
+
+
+INVALID = {"error": {"code": 400, "message": "Invalid id value", "status": "INVALID_ARGUMENT"}}
+NO_SUCH_ROUTE = "<!DOCTYPE html><html lang=en><title>Error 404 (Not Found)!!1</title></html>"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(400, json=INVALID),
+        httpx.Response(403, json=FORBIDDEN),
+        # What a route Gmail does not have answers: not "already deleted".
+        httpx.Response(404, text=NO_SUCH_ROUTE, headers={"content-type": "text/html"}),
+    ],
+)
+async def test_a_permanent_delete_gmail_refuses_is_an_error(answer):
+    fake = FakeTime()
+    handler, sent = _scripted(fake, answer)
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.delete_message_permanently("m1")
+    finally:
+        await http_client.aclose()
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_labels_are_read_fresh_from_gmail():
+    fake = FakeTime()
+    seen: list[tuple[str, str]] = []
+    answers = [
+        httpx.Response(200, json={"id": "m1", "labelIds": ["TRASH", "IMPORTANT"]}),
+        httpx.Response(404, json={"error": {"code": 404, "message": "Requested entity was not found."}}),
+        httpx.Response(404, text=NO_SUCH_ROUTE, headers={"content-type": "text/html"}),
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.url.params.get("format")))
+        return answers.pop(0)
+
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
+    try:
+        assert await client.get_labels("m1") == ["IMPORTANT", "TRASH"]
+        assert await client.get_labels("gone") is None
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_labels("m3")
+    finally:
+        await http_client.aclose()
+    assert seen[0] == ("/gmail/v1/users/me/messages/m1", "minimal")
 
 
 @pytest.mark.asyncio
@@ -661,6 +715,46 @@ async def test_a_processing_failure_keeps_the_throttle_as_its_cause():
     assert isinstance(raised.value.__cause__, GmailRateLimited)
 
 
+def test_history_pages_halve_per_failed_throttled_run_down_to_one():
+    size = EmailProcessor._history_page_size
+    assert [size("PROVIDER_RATE_LIMITED", failures) for failures in range(9)] == [100, 50, 25, 12, 6, 3, 1, 1, 1]
+    # A throttled run that saved its place resets the count: full pages again.
+    assert size("PROVIDER_RATE_LIMITED", 0) == 100
+    # Other failures do not shrink them.
+    assert size("PROVIDER_TIMEOUT", 5) == 100
+    assert size(None, 0) == 100
+
+
+def _http_error(status: int, url: str) -> httpx.HTTPStatusError:
+    response = httpx.Response(status, request=httpx.Request("GET", url))
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        response.raise_for_status()
+    return raised.value
+
+
+MESSAGE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/18c4291fa0b1c2d3?format=raw"
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (GmailRateLimited(30), "PROVIDER_RATE_LIMITED"),
+        (_http_error(429, MESSAGE_URL), "PROVIDER_RATE_LIMITED"),
+        # The URL holds "429", in the message id: a 500 is still a 500.
+        (_http_error(500, MESSAGE_URL), "PROVIDER_SYNC_FAILED"),
+        (_http_error(401, MESSAGE_URL), "ACCOUNT_AUTH_FAILED"),
+        (_http_error(504, MESSAGE_URL), "PROVIDER_TIMEOUT"),
+        (_http_error(403, MESSAGE_URL), "PROVIDER_SYNC_FAILED"),
+        # Text from other providers is still read as before.
+        (RuntimeError("LOGIN failed"), "ACCOUNT_AUTH_FAILED"),
+        (RuntimeError("rate limit exceeded"), "PROVIDER_RATE_LIMITED"),
+        (RuntimeError("connection timed out"), "PROVIDER_TIMEOUT"),
+    ],
+)
+def test_a_sync_error_is_classified_by_what_it_is(error, code):
+    assert EmailProcessor._sync_error(error)[0] == code
+
+
 def test_the_run_stops_waiting_well_before_its_job_deadline():
     processor = EmailProcessor()
     processor.job_deadline = 5000.0
@@ -779,6 +873,9 @@ async def test_a_throttled_permanent_delete_records_what_gmail_removed(monkeypat
     monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
 
     class Client:
+        async def get_labels(self, message_id):
+            return ["TRASH"]
+
         async def delete_message_permanently(self, message_id):
             if message_id == "g2":
                 raise GmailRateLimited(20)
@@ -796,3 +893,49 @@ async def test_a_throttled_permanent_delete_records_what_gmail_removed(monkeypat
     assert db.commits == 1
     assert raised.value.status_code == 429
     assert "2 of 3 messages were deleted permanently." in raised.value.detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_delete_leaves_a_message_restored_in_gmail_alone(monkeypatch):
+    from src.services import write_service
+
+    messages = _gmail_messages()
+    placements = {m.id: SimpleNamespace(folder="TRASH") for m in messages}
+    selection = SimpleNamespace(
+        account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
+        targets=[(m, placements[m.id]) for m in messages],
+        skipped=[],
+        matched=3,
+    )
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
+    recorded = []
+    monkeypatch.setattr(
+        write_service, "_record_gmail_labels", lambda db, message, labels: recorded.append((message.id, labels))
+    )
+    # The index says all three are in the Bin. In Gmail, g1 was restored to the
+    # Inbox since, g2 is gone already, and only g3 is still in the Bin.
+    now_in_gmail = {"g1": ["INBOX"], "g2": None, "g3": ["TRASH"]}
+    deleted = []
+
+    class Client:
+        async def get_labels(self, message_id):
+            return now_in_gmail[message_id]
+
+        async def delete_message_permanently(self, message_id):
+            deleted.append(message_id)
+
+    async def fake_gmail(db, account, operation):
+        return await operation(Client())
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    db = _Db()
+    result = await write_service.delete_mail(db, SimpleNamespace(id=1), permanent=True, email_ids=[1, 2, 3])
+
+    assert deleted == ["g3"]
+    assert recorded == [(1, ["INBOX"])]
+    assert db.deleted == [placements[2], placements[3]]
+    assert [m.deleted_at is not None for m in messages] == [False, True, True]
+    assert result["affected"] == 2
+    assert result["skipped"] == 1
+    assert result["skipped_reasons"][0]["email_ids"] == [1]
