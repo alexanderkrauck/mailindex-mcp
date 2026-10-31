@@ -875,7 +875,7 @@ async def test_a_throttled_permanent_delete_records_what_gmail_removed(monkeypat
     from src.services import write_service
 
     messages = _gmail_messages()
-    placements = {m.id: SimpleNamespace(folder="[Gmail]/Trash") for m in messages}
+    placements = {m.id: SimpleNamespace(folder="TRASH") for m in messages}
     selection = SimpleNamespace(
         account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
         targets=[(m, placements[m.id]) for m in messages],
@@ -1001,7 +1001,8 @@ async def test_a_message_whose_labels_could_not_be_read_is_not_deleted(monkeypat
     assert "1 of 3 messages were deleted permanently." in text
     # The answer says which ones were left alone and why, so a retry does not
     # push mail someone restored back into the Bin.
-    assert "Left in place, because Gmail no longer has them in the Bin or Spam: 1 (email ids 1)." in text
+    assert "Left in place, because Gmail no longer has them in the Bin or Spam: 1 (email ids 1);" in text
+    assert "leave them out when retrying." in text
 
 
 @pytest.mark.asyncio
@@ -1095,3 +1096,50 @@ async def test_a_permanent_delete_against_the_database(sessions, monkeypatch):
         assert [p.folder for p in db.query(MessagePlacement).filter_by(email_log_id=1)] == ["INBOX"]
         assert db.query(EmailLog).filter(EmailLog.deleted_at.isnot(None)).count() == 29
         assert db.query(MessagePlacement).filter(MessagePlacement.email_log_id != 1).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffixes", "folder", "refused"),
+    [
+        # Widened to hide archived mail from search: archived mail is still not deletable.
+        (["trash", "spam", "archive"], "ARCHIVE", True),
+        # Narrowed so Spam shows in search: Spam is still deletable.
+        (["trash"], "SPAM", False),
+    ],
+)
+async def test_what_may_be_deleted_for_good_does_not_follow_the_search_setting(monkeypatch, suffixes, folder, refused):
+    from src.config import settings
+    from src.services import write_service
+
+    monkeypatch.setattr(settings, "excluded_folder_suffixes", suffixes)
+    message = _gmail_messages()[0]
+    selection = SimpleNamespace(
+        account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
+        targets=[(message, SimpleNamespace(folder=folder))],
+        skipped=[],
+        matched=1,
+    )
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
+    deleted = []
+
+    class Client:
+        async def get_labels(self, message_id):
+            return [folder]
+
+        async def delete_message_permanently(self, message_id):
+            deleted.append(message_id)
+
+    async def fake_gmail(db, account, operation):
+        return await operation(Client())
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    if refused:
+        with pytest.raises(HTTPException) as raised:
+            await write_service.delete_mail(_Db(), SimpleNamespace(id=1), permanent=True, email_ids=[1])
+        assert raised.value.status_code == 409
+        assert deleted == []
+    else:
+        await write_service.delete_mail(_Db(), SimpleNamespace(id=1), permanent=True, email_ids=[1])
+        assert deleted == ["g1"]

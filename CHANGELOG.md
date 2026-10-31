@@ -58,12 +58,15 @@ Notable changes. Dates are release dates; the git history is finer grained.
   Gmail. So each message's labels are read from Gmail first, and only one Gmail
   itself still has in the Bin or Spam is deleted. One restored since the index
   last saw it is left alone, its new place is recorded, and the answer lists it
-  as skipped, also when the call ends throttled or refused.
+  as skipped, also when the call ends throttled or refused (with the advice to
+  leave it out of a retry).
 - A message Gmail no longer has counts as deleted. Any other refusal stays an
   error, including a 404 that is not Gmail's own "not found".
 - Asked to delete mail that is not in the Bin, the answer now names the
   messages, and no longer tells the caller to move them there first without
-  saying that one someone restored was taken out on purpose.
+  saying that one someone restored was taken out on purpose. This check and the
+  live one both go by Gmail's own Bin and Spam, not by the setting that hides
+  folders from search.
 
 ## v0.3.2 — 2026-10-31
 

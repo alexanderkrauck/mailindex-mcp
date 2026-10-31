@@ -528,11 +528,9 @@ async def delete_mail(
             )
             return _outcome(selection, limit, permanent=False, to="TRASH", moved=changed)
 
-        outside = [
-            message.id
-            for message, placement in selection.targets
-            if not is_excluded_folder(placement.folder, suffixes)
-        ]
+        # The same definition as the live check below: Gmail's Bin and Spam, not
+        # the search-exclusion setting.
+        outside = [message.id for message, placement in selection.targets if placement.folder not in (TRASH, SPAM)]
         if outside:
             raise HTTPException(
                 status_code=409,
@@ -601,7 +599,8 @@ async def delete_mail(
             if left_in_place:
                 done += (
                     " Left in place, because Gmail no longer has them in the Bin or Spam: "
-                    f"{len(left_in_place)} (email ids {_some_ids(left_in_place)})."
+                    f"{len(left_in_place)} (email ids {_some_ids(left_in_place)}); leave them "
+                    "out when retrying."
                 )
             _raise_gmail_failure(failure, done=done)
         return _outcome(selection, limit, permanent=True)
