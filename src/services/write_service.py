@@ -561,7 +561,7 @@ async def delete_mail(
             removed += 1
         db.commit()
         if failure is not None:
-            _raise_gmail_failure(failure, applied=removed, total=len(results))
+            _raise_gmail_failure(failure, done=f"{removed} of {len(results)} messages were deleted permanently.")
         return _outcome(selection, limit, permanent=True)
 
     if permanent:
@@ -944,16 +944,21 @@ def _is_gmail_api(account: SMTPConfig) -> bool:
     return account.provider == "gmail" and account.auth_type == "oauth2"
 
 
-def _gmail_failure(exc: BaseException, *, applied: int | None = None, total: int | None = None) -> BaseException:
-    """The HTTPException a tool call answers with for a Gmail failure; others unchanged."""
+def _gmail_failure(exc: BaseException, *, done: str = "") -> BaseException:
+    """The HTTPException a tool call answers with for a Gmail failure; others unchanged.
+
+    ``done`` says what of a batch Gmail did before the failure, e.g. "2 of 3
+    messages were deleted permanently."
+    """
     from src.email.gmail_api_client import GmailRateLimited
 
-    done = f" {applied} of {total} changes were applied and recorded." if applied is not None else ""
     if isinstance(exc, GmailRateLimited):
         return HTTPException(
             status_code=429,
             detail={
-                "message": f"Gmail is rate-limiting this mailbox.{done} Retry shortly to continue.",
+                "message": " ".join(
+                    part for part in ("Gmail is rate-limiting this mailbox.", done, "Retry shortly to continue.") if part
+                ),
                 "retry_after": math.ceil(exc.retry_after),
             },
         )
@@ -962,14 +967,14 @@ def _gmail_failure(exc: BaseException, *, applied: int | None = None, total: int
             status_code=502,
             detail=(
                 f"Gmail refused the change: {exc.response.status_code} {exc.response.text[:200]}"
-                + (f".{done}" if done else "")
+                + (f". {done}" if done else "")
             ),
         )
     return exc
 
 
-def _raise_gmail_failure(failure: BaseException, *, applied: int, total: int):
-    mapped = _gmail_failure(failure, applied=applied, total=total)
+def _raise_gmail_failure(failure: BaseException, *, done: str):
+    mapped = _gmail_failure(failure, done=done)
     if mapped is failure:
         raise failure
     raise mapped from failure
@@ -1069,5 +1074,5 @@ async def _gmail_relabel(
         changed += 1
     db.commit()
     if failure is not None:
-        _raise_gmail_failure(failure, applied=changed, total=len(results))
+        _raise_gmail_failure(failure, done=f"{changed} of {len(results)} messages now have the requested labels.")
     return changed

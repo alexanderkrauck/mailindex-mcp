@@ -228,7 +228,8 @@ async def test_paced_requests_stop_at_the_deadline():
     # fall past the deadline: ten, not the fifty asked for.
     assert len(sent) == 11
     assert max(sent) <= deadline
-    assert raised.value.retry_after == 1.0
+    # Come back after as long as the quota last needed, not straight away.
+    assert raised.value.retry_after == 5.0
 
 
 @pytest.mark.asyncio
@@ -325,14 +326,10 @@ async def test_parallel_401s_refresh_the_token_once(monkeypatch, late_answers_af
 
 
 @pytest.mark.asyncio
-async def test_a_throttled_permanent_delete_waits_then_falls_back():
+async def test_a_throttled_permanent_delete_waits_then_deletes():
     fake = FakeTime()
     calls: list[tuple[str, str, int]] = []
-    answers = [
-        httpx.Response(403, json=THROTTLED),
-        httpx.Response(405, json={}),
-        httpx.Response(204),
-    ]
+    answers = [httpx.Response(403, json=THROTTLED), httpx.Response(204)]
 
     async def handler(request: httpx.Request) -> httpx.Response:
         response = answers.pop(0)
@@ -345,8 +342,21 @@ async def test_a_throttled_permanent_delete_waits_then_falls_back():
     finally:
         await http_client.aclose()
 
-    assert calls == [("POST", "delete", 403), ("POST", "delete", 405), ("DELETE", "m1", 204)]
-    assert fake.sleeps[0] == 5.0
+    # Gmail's route is DELETE messages/{id}; it has no POST messages/{id}/delete.
+    assert calls == [("DELETE", "m1", 403), ("DELETE", "m1", 204)]
+    assert fake.sleeps == [5.0]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_delete_of_a_message_gmail_no_longer_has_succeeds():
+    fake = FakeTime()
+    handler, sent = _scripted(fake, httpx.Response(404, json={"error": {"code": 404, "message": "Not Found"}}))
+    client, http_client = _client(handler, fake, throttle_deadline=fake.now + 120)
+    try:
+        await client.delete_message_permanently("gone")
+    finally:
+        await http_client.aclose()
+    assert len(sent) == 1
 
 
 @pytest.mark.asyncio
@@ -476,6 +486,7 @@ class FakeGmail:
         self.history = history
         self.fetched: list[str] = []
         self.profile_calls = 0
+        self.page_sizes: list[int] = []
 
     async def get_profile(self):
         self.profile_calls += 1
@@ -484,7 +495,8 @@ class FakeGmail:
     async def list_messages(self, *, page_token=None, max_results=100):
         return {"messages": [{"id": message_id} for message_id in self.ids]}
 
-    async def list_history(self, start_history_id, *, page_token=None):
+    async def list_history(self, start_history_id, *, page_token=None, max_results=100):
+        self.page_sizes.append(max_results)
         return self.history
 
     async def get_parsed_message(self, message_id):
@@ -578,6 +590,7 @@ async def test_a_history_page_cut_short_is_not_progress(sessions, monkeypatch):
     assert await _sync(sessions, _recording_processor(sessions, monkeypatch, gmail)) is False
     # h1 was fetched, but the page is fetched again in full next time: no progress.
     assert gmail.fetched == ["h1"]
+    assert gmail.page_sizes == [100]
     account = _account(sessions)
     assert account.sync_state == "error"
     assert account.last_error_code == "PROVIDER_RATE_LIMITED"
@@ -586,10 +599,16 @@ async def test_a_history_page_cut_short_is_not_progress(sessions, monkeypatch):
 
     gmail = FakeGmail([], history=history)
     assert await _sync(sessions, _recording_processor(sessions, monkeypatch, gmail)) is True
+    # Smaller pages after runs that could not finish one: 100 halved per failure.
+    assert gmail.page_sizes == [3]
     account = _account(sessions)
     assert account.provider_sync_token == "600"
     assert account.sync_state == "healthy"
     assert account.consecutive_failures == 0
+
+    gmail = FakeGmail([], history={"history": [], "historyId": "700"})
+    assert await _sync(sessions, _recording_processor(sessions, monkeypatch, gmail)) is True
+    assert gmail.page_sizes == [100]
 
 
 @pytest.mark.asyncio
@@ -741,7 +760,7 @@ async def test_a_throttled_relabel_records_what_gmail_applied(monkeypatch):
     assert db.commits == 1
     assert raised.value.status_code == 429
     assert raised.value.detail["retry_after"] == 9
-    assert "2 of 3 changes were applied" in raised.value.detail["message"]
+    assert "2 of 3 messages now have the requested labels." in raised.value.detail["message"]
 
 
 @pytest.mark.asyncio
@@ -776,4 +795,4 @@ async def test_a_throttled_permanent_delete_records_what_gmail_removed(monkeypat
     assert [m.deleted_at is not None for m in messages] == [True, False, True]
     assert db.commits == 1
     assert raised.value.status_code == 429
-    assert "2 of 3 changes were applied" in raised.value.detail["message"]
+    assert "2 of 3 messages were deleted permanently." in raised.value.detail["message"]

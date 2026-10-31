@@ -355,10 +355,12 @@ def reap_tombstoned_messages(db, *, config_id: int, now: datetime | None = None)
 class EmailProcessor:
     """Main email processing orchestrator."""
 
-    # Throttle waits stop this long before the job's deadline: longer than one
-    # request may take (httpx's 30 s timeout) plus committing what arrived, so the
-    # run records where it stopped while its lease still fences the writes.
+    # Throttle waits stop this long before the job's deadline: twice httpx's 30 s
+    # timeout (which applies per connect, read and write, not per request), so the
+    # requests in flight and committing what arrived normally finish while the
+    # lease still fences the writes. A slower run is still ended by the supervisor.
     GMAIL_THROTTLE_MARGIN_SECONDS = 60.0
+    GMAIL_HISTORY_PAGE_SIZE = 100
 
     def __init__(self):
         self.active_clients = {}
@@ -852,12 +854,19 @@ class EmailProcessor:
 
         if progress is None:
             progress = _GmailRunProgress()
+        with get_db_session() as db:
+            account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
+            page_size = self.GMAIL_HISTORY_PAGE_SIZE
+            if account.last_error_code == "PROVIDER_RATE_LIMITED":
+                # Runs a throttle ended before they finished a page: ask for
+                # smaller pages, halving per failed run, until one finishes.
+                page_size = max(1, page_size >> min(account.consecutive_failures or 0, 7))
         for _ in range(settings.gmail_history_pages_per_cycle):
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
                 page_token = account.sync_page_token
 
-            page = await client.list_history(start_history_id, page_token=page_token)
+            page = await client.list_history(start_history_id, page_token=page_token, max_results=page_size)
             changed_ids, deleted_ids = self._gmail_history_changes(page)
             processed_count, missing_ids = await self._fetch_and_process_gmail_messages(
                 client,

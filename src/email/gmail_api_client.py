@@ -132,7 +132,11 @@ class GmailApiClient:
         return seconds if seconds is not None and math.isfinite(seconds) and seconds >= 0 else None
 
     def _rate_limited(self, now: float) -> GmailRateLimited:
-        return GmailRateLimited(self._gate_until - now)
+        if self._gate_until > now:
+            return GmailRateLimited(self._gate_until - now)
+        # The paced slots ran out: the last pause is the best guess of how long
+        # the quota needs, rather than inviting an immediate unpaced retry.
+        return GmailRateLimited(self.throttle_pauses[-1] if self.throttle_pauses else 1.0)
 
     async def _admit(self) -> None:
         """Wait until this client may send: past the gate, then on a paced slot while throttled."""
@@ -268,11 +272,11 @@ class GmailApiClient:
         return await self._request("messages", params=params) or {}
 
     async def list_history(
-        self, start_history_id: str, *, page_token: str | None = None
+        self, start_history_id: str, *, page_token: str | None = None, max_results: int = 100
     ) -> dict:
         # Small pages: a synchronization saves its place after each one, and a
         # throttled run must be able to finish a page to make progress.
-        params = {"startHistoryId": start_history_id, "maxResults": 100}
+        params = {"startHistoryId": start_history_id, "maxResults": max_results}
         if page_token:
             params["pageToken"] = page_token
         return (
@@ -316,10 +320,14 @@ class GmailApiClient:
         return sorted(str(label) for label in result.get("labelIds", []))
 
     async def delete_message_permanently(self, message_id: str) -> None:
-        """Remove a message outright. There is no undo for this on Gmail's side."""
-        response = await self._send("POST", f"messages/{message_id}/delete")
-        if response.status_code == 405:
-            response = await self._send("DELETE", f"messages/{message_id}")
+        """Remove a message outright. There is no undo for this on Gmail's side.
+
+        Gmail's route is DELETE messages/{id}; there is no POST .../delete (it
+        answers 404). A message Gmail no longer has is already what was asked for.
+        """
+        response = await self._send("DELETE", f"messages/{message_id}")
+        if response.status_code == 404:
+            return
         response.raise_for_status()
 
     async def create_draft(self, raw: bytes, *, thread_id: str | None = None) -> dict | None:
