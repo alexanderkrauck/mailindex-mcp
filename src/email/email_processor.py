@@ -27,6 +27,10 @@ from src.services.message_metadata import content_fingerprint, participant_model
 
 logger = logging.getLogger(__name__)
 
+# How providers word a throttle in an error text. Phrases, not bare "rate" or
+# "429": those occur in message ids, subjects and words like "generate".
+THROTTLE_PHRASES = ("rate limit", "rate-limit", "ratelimit", "rate exceeded", "too many requests", "throttl")
+
 
 def upsert_placement(
     db,
@@ -590,7 +594,7 @@ class EmailProcessor:
             code = "ACCOUNT_AUTH_FAILED"
         elif "timeout" in lowered or "timed out" in lowered:
             code = "PROVIDER_TIMEOUT"
-        elif "rate" in lowered or "429" in lowered:
+        elif any(phrase in lowered for phrase in THROTTLE_PHRASES):
             code = "PROVIDER_RATE_LIMITED"
         else:
             code = "PROVIDER_SYNC_FAILED"

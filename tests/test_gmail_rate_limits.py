@@ -374,6 +374,8 @@ NO_SUCH_ROUTE = "<!DOCTYPE html><html lang=en><title>Error 404 (Not Found)!!1</t
         httpx.Response(403, json=FORBIDDEN),
         # What a route Gmail does not have answers: not "already deleted".
         httpx.Response(404, text=NO_SUCH_ROUTE, headers={"content-type": "text/html"}),
+        # Nor is a JSON 404 that is not Gmail's own "not found".
+        httpx.Response(404, json={"message": "Not Found"}),
     ],
 )
 async def test_a_permanent_delete_gmail_refuses_is_an_error(answer):
@@ -742,12 +744,23 @@ MESSAGE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/18c4291fa
         (_http_error(429, MESSAGE_URL), "PROVIDER_RATE_LIMITED"),
         # The URL holds "429", in the message id: a 500 is still a 500.
         (_http_error(500, MESSAGE_URL), "PROVIDER_SYNC_FAILED"),
+        # Whatever words the URL holds, the status decides.
+        (
+            _http_error(500, "https://gmail.googleapis.com/gmail/v1/users/me/messages?q=throttled"),
+            "PROVIDER_SYNC_FAILED",
+        ),
         (_http_error(401, MESSAGE_URL), "ACCOUNT_AUTH_FAILED"),
         (_http_error(504, MESSAGE_URL), "PROVIDER_TIMEOUT"),
+        (_http_error(408, MESSAGE_URL), "PROVIDER_TIMEOUT"),
         (_http_error(403, MESSAGE_URL), "PROVIDER_SYNC_FAILED"),
         # Text from other providers is still read as before.
         (RuntimeError("LOGIN failed"), "ACCOUNT_AUTH_FAILED"),
         (RuntimeError("rate limit exceeded"), "PROVIDER_RATE_LIMITED"),
+        (RuntimeError("429 Too Many Requests"), "PROVIDER_RATE_LIMITED"),
+        (RuntimeError("Request is throttled"), "PROVIDER_RATE_LIMITED"),
+        # "429" in a message id, "rate" in a subject: not a throttle.
+        (RuntimeError("Gmail message 18c4291fa0b1c2d3 did not include an RFC822 payload"), "PROVIDER_SYNC_FAILED"),
+        (RuntimeError("could not store 'Exchange rate update'"), "PROVIDER_SYNC_FAILED"),
         (RuntimeError("connection timed out"), "PROVIDER_TIMEOUT"),
     ],
 )
@@ -939,3 +952,146 @@ async def test_a_permanent_delete_leaves_a_message_restored_in_gmail_alone(monke
     assert result["affected"] == 2
     assert result["skipped"] == 1
     assert result["skipped_reasons"][0]["email_ids"] == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refusal", "status"),
+    [(GmailRateLimited(9), 429), (_http_error(500, MESSAGE_URL), 502)],
+)
+async def test_a_message_whose_labels_could_not_be_read_is_not_deleted(monkeypatch, refusal, status):
+    from src.services import write_service
+
+    messages = _gmail_messages()
+    placements = {m.id: SimpleNamespace(folder="TRASH") for m in messages}
+    selection = SimpleNamespace(
+        account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
+        targets=[(m, placements[m.id]) for m in messages],
+        skipped=[],
+        matched=3,
+    )
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
+    monkeypatch.setattr(write_service, "_record_gmail_labels", lambda db, message, labels: None)
+    deleted = []
+
+    class Client:
+        async def get_labels(self, message_id):
+            if message_id == "g2":
+                raise refusal
+            return {"g1": ["INBOX"], "g3": ["TRASH"]}[message_id]
+
+        async def delete_message_permanently(self, message_id):
+            deleted.append(message_id)
+
+    async def fake_gmail(db, account, operation):
+        return await operation(Client())
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    db = _Db()
+    with pytest.raises(HTTPException) as raised:
+        await write_service.delete_mail(db, SimpleNamespace(id=1), permanent=True, email_ids=[1, 2, 3])
+
+    assert deleted == ["g3"]
+    assert [m.deleted_at is not None for m in messages] == [False, False, True]
+    assert db.deleted == [placements[3]]
+    assert raised.value.status_code == status
+    detail = raised.value.detail
+    text = detail["message"] if isinstance(detail, dict) else detail
+    assert "1 of 3 messages were deleted permanently." in text
+    # The answer says which ones were left alone and why, so a retry does not
+    # push mail someone restored back into the Bin.
+    assert "Left in place, because Gmail no longer has them in the Bin or Spam: 1 (email ids 1)." in text
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_delete_of_mail_outside_the_bin_names_it(monkeypatch):
+    from src.services import write_service
+
+    messages = _gmail_messages()
+    selection = SimpleNamespace(
+        account=SimpleNamespace(id=5, provider="gmail", auth_type="oauth2"),
+        targets=[(messages[0], SimpleNamespace(folder="INBOX")), (messages[1], SimpleNamespace(folder="TRASH"))],
+        skipped=[],
+        matched=2,
+    )
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    monkeypatch.setattr(write_service, "_select", lambda db, user, ids, filters, limit: selection)
+    with pytest.raises(HTTPException) as raised:
+        await write_service.delete_mail(_Db(), SimpleNamespace(id=1), permanent=True, email_ids=[1, 2])
+    assert raised.value.status_code == 409
+    assert "(email ids 1)" in raised.value.detail
+    assert "taken out on purpose" in raised.value.detail
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_delete_against_the_database(sessions, monkeypatch):
+    from sqlalchemy import event
+
+    from src.email.gmail_labels import parse_labels
+    from src.models.placement import MessagePlacement
+    from src.services import write_service
+
+    with sessions.begin() as db:
+        for n in range(1, 31):
+            db.add(
+                EmailLog(
+                    id=n,
+                    smtp_config_id=1,
+                    sender="a",
+                    recipient="b",
+                    subject="s",
+                    message_id=f"<{n}@example.invalid>",
+                    provider_message_id=f"g{n}",
+                    email_date=datetime.now(timezone.utc),
+                    flags='["TRASH"]',
+                )
+            )
+            db.add(MessagePlacement(email_log_id=n, folder="TRASH", uid=None, uid_validity=None))
+    # The index has all thirty in the Bin. In Gmail, g1 was restored to the Inbox
+    # since, and g2 sits in Spam.
+    now_in_gmail = {f"g{n}": ["TRASH"] for n in range(1, 31)} | {"g1": ["INBOX"], "g2": ["SPAM"]}
+    deleted = []
+
+    class Client:
+        async def get_labels(self, message_id):
+            return now_in_gmail[message_id]
+
+        async def delete_message_permanently(self, message_id):
+            deleted.append(message_id)
+
+    async def fake_gmail(db, account, operation):
+        try:
+            return await operation(Client())
+        finally:
+            db.commit()  # as releasing the lease does: every row is expired after it
+
+    monkeypatch.setattr(write_service, "_gmail", fake_gmail)
+    monkeypatch.setattr(write_service, "_rate_limit", lambda user_id: None)
+    engine = sessions.kw["bind"]
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    db = sessions()
+    commits: list[int] = []
+    event.listen(db, "after_commit", lambda session: commits.append(len(statements)))
+    try:
+        result = await write_service.delete_mail(db, db.get(User, 1), permanent=True, email_ids=list(range(1, 31)))
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+        db.close()
+
+    assert sorted(deleted) == sorted(f"g{n}" for n in range(2, 31))
+    assert (result["affected"], result["skipped"]) == (29, 1)
+    # Nothing reads the thirty rows back after the final commit.
+    assert not [s for s in statements[commits[-1] :] if "FROM email_logs" in s]
+    with sessions() as db:
+        restored = db.get(EmailLog, 1)
+        assert restored.deleted_at is None
+        assert parse_labels(restored.flags) == ["INBOX"]
+        assert [p.folder for p in db.query(MessagePlacement).filter_by(email_log_id=1)] == ["INBOX"]
+        assert db.query(EmailLog).filter(EmailLog.deleted_at.isnot(None)).count() == 29
+        assert db.query(MessagePlacement).filter(MessagePlacement.email_log_id != 1).count() == 0

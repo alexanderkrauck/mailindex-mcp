@@ -33,6 +33,8 @@ from src.email.email_processor import (
 from src.email.gmail_labels import (
     ARCHIVE,
     LOCATIONS,
+    SPAM,
+    TRASH,
     labels_for_move,
     location_for,
     parse_labels,
@@ -82,6 +84,12 @@ MARKS = {
 }
 
 _recent_writes: dict[int, list[datetime]] = {}
+
+
+def _some_ids(ids) -> str:
+    """Up to twenty ids for a message, in order."""
+    ordered = sorted(ids)
+    return ", ".join(str(i) for i in ordered[:20]) + (", ..." if len(ordered) > 20 else "")
 
 
 def _rate_limit(user_id: int) -> None:
@@ -529,9 +537,10 @@ async def delete_mail(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"{len(outside)} of these messages are not in Gmail's Bin yet. Send "
-                    "them there first; only a message already in Trash can be removed "
-                    "permanently."
+                    f"{len(outside)} of these messages are not in Gmail's Bin or Spam "
+                    f"(email ids {_some_ids(outside)}). Only a message already there can be "
+                    "removed permanently. Move one to the Bin first only if it is meant to "
+                    "go: a message someone restored from the Bin was taken out on purpose."
                 ),
             )
 
@@ -546,7 +555,9 @@ async def delete_mail(
                     labels = await client.get_labels(message.provider_message_id)
                     if labels is None:
                         return None  # Gmail no longer has it
-                    if not is_excluded_folder(location_for(labels), suffixes):
+                    # Gmail's own labels, not the search-exclusion setting, which
+                    # an operator may widen to hide other mail from search.
+                    if not {TRASH, SPAM} & set(labels):
                         return labels
                     await client.delete_message_permanently(message.provider_message_id)
                     return None
@@ -560,27 +571,39 @@ async def delete_mail(
         results = await _gmail(db, selection.account, destroy)
         now = datetime.now(tz=timezone.utc)
         removed = 0
-        left_in_place: set[int] = set()
+        kept: list[tuple[EmailLog, MessagePlacement]] = []
+        left_in_place: list[int] = []
         failure: BaseException | None = None
-        for (message, placement), result in zip(selection.targets, results, strict=True):
+        for target, result in zip(selection.targets, results, strict=True):
+            message, placement = target
             if isinstance(result, BaseException):
                 failure = failure or result
+                kept.append(target)
                 continue
             if result is not None:
                 # Moved out of the Bin or Spam in Gmail: record where it is now.
                 _record_gmail_labels(db, message, result)
-                left_in_place.add(message.id)
+                left_in_place.append(message.id)
                 selection.skipped.append(
                     {"email_id": message.id, "reason": "no longer in Trash or Spam in Gmail; left in place"}
                 )
                 continue
+            kept.append(target)
             db.delete(placement)
             message.deleted_at = now
             removed += 1
         db.commit()
-        selection.targets = [target for target in selection.targets if target[0].id not in left_in_place]
+        # Kept by identity: the commit expired every row, and reading an id back
+        # would reload each one.
+        selection.targets = kept
         if failure is not None:
-            _raise_gmail_failure(failure, done=f"{removed} of {len(results)} messages were deleted permanently.")
+            done = f"{removed} of {len(results)} messages were deleted permanently."
+            if left_in_place:
+                done += (
+                    " Left in place, because Gmail no longer has them in the Bin or Spam: "
+                    f"{len(left_in_place)} (email ids {_some_ids(left_in_place)})."
+                )
+            _raise_gmail_failure(failure, done=done)
         return _outcome(selection, limit, permanent=True)
 
     if permanent:

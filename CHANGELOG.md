@@ -35,6 +35,8 @@ Notable changes. Dates are release dates; the git history is finer grained.
 - A synchronization error from one of Gmail's HTTP answers is classified by its
   status, not by words in its text. The text includes the request URL, so a 500
   for a message whose id happened to contain "429" showed as rate limiting.
+  Other error texts count as throttling only for phrases such as "rate limit",
+  "too many requests" or "throttled", no longer for a bare "rate" or "429".
 - A tool call (a label change, a move to Trash, a permanent deletion, a draft, an
   attachment fetch) waits at most 15 seconds, then answers `RATE_LIMITED` with
   `retry_after`: the remaining pause, or once paced requests run out of time,
@@ -53,11 +55,15 @@ Notable changes. Dates are release dates; the git history is finer grained.
   never came. It now calls `DELETE` directly, through the same throttle handling
   and token refresh as every other Gmail call.
 - Gmail deletes a message whatever its labels are, and the index can be behind
-  Gmail. So each message's labels are read from Gmail first: one that is no
-  longer in the Bin or Spam there (restored since the index last saw it) is
-  left alone, its new place is recorded, and the answer lists it as skipped.
+  Gmail. So each message's labels are read from Gmail first, and only one Gmail
+  itself still has in the Bin or Spam is deleted. One restored since the index
+  last saw it is left alone, its new place is recorded, and the answer lists it
+  as skipped, also when the call ends throttled or refused.
 - A message Gmail no longer has counts as deleted. Any other refusal stays an
   error, including a 404 that is not Gmail's own "not found".
+- Asked to delete mail that is not in the Bin, the answer now names the
+  messages, and no longer tells the caller to move them there first without
+  saying that one someone restored was taken out on purpose.
 
 ## v0.3.2 — 2026-10-31
 
