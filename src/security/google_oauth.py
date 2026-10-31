@@ -12,13 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 class McpGoogleProvider(GoogleProvider):
-    """FastMCP's GoogleProvider, plus a log line for every refused client registration.
+    """FastMCP's GoogleProvider, plus a log line when a registration's callback is refused.
 
     FastMCP answers a registration whose callback is not allowed with
     ``400 invalid_redirect_uri`` and logs nothing, so a client that could not
     connect left no trace on the server. The callback it asked for is what an
-    operator needs to decide whether to allow it. Client name and callbacks are
-    the caller's own claims, so they are logged truncated and quoted.
+    operator needs to decide whether to allow it. Only refusals raised here are
+    logged: the MCP SDK rejects a bad scope, grant type or response type before
+    this method runs. Client name and callbacks are the caller's own claims, so
+    they are logged truncated and quoted.
     """
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:

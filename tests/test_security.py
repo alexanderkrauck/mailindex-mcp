@@ -205,7 +205,7 @@ GROK_CALLBACKS = [
 ]
 
 
-def test_grok_connector_callbacks_are_allowlisted_and_nothing_near_them():
+def test_grok_connector_callbacks_are_allowlisted_and_lookalikes_are_not():
     from fastmcp.server.auth.redirect_validation import validate_redirect_uri
 
     from src.config import settings
@@ -274,3 +274,22 @@ async def test_grok_can_register_itself_by_dynamic_client_registration(caplog):
         logged = [r.getMessage() for r in caplog.records if r.name == "src.security.google_oauth"]
         assert len(logged) == 1
         assert "'Grok'" in logged[0] and lookalike in logged[0] and "invalid_redirect_uri" in logged[0]
+
+
+def test_google_mode_serves_the_provider_that_logs_refusals(monkeypatch, tmp_path):
+    """Production builds its provider here; the registration tests construct one directly."""
+    import fastmcp
+
+    from src.config import settings
+    from src.security import auth
+    from src.security.google_oauth import McpGoogleProvider
+
+    monkeypatch.setattr(fastmcp.settings, "home", tmp_path)
+    monkeypatch.setattr(settings, "auth_mode", "google")
+    monkeypatch.setattr(settings, "google_client_id", "test.apps.googleusercontent.com")
+    monkeypatch.setattr(settings, "google_client_secret", "test-secret")
+    monkeypatch.setattr(settings, "jwt_signing_key", "long-enough-test-signing-key")
+    monkeypatch.setattr(settings, "public_base_url", "https://mail.example.com")
+    monkeypatch.setattr(auth, "_mcp_auth_provider", None)
+
+    assert isinstance(auth.build_mcp_auth_provider(), McpGoogleProvider)

@@ -198,8 +198,8 @@ characters or the server refuses to start. **What you need:** a VPS with ~2 GB
 RAM and disk for roughly 25 MB per 1,000 messages, a domain, and an app password
 per mailbox. **What to expect:** works with anything that sends an
 `Authorization` header — Claude Code, Cursor, `mcp-remote`. It will *not* work
-with the claude.ai, ChatGPT or Grok web connectors, which negotiate OAuth and
-cannot send a static token. If you want those, use the next one.
+with the claude.ai or ChatGPT web connectors, which negotiate OAuth and cannot
+send a static token. If you want those, use the next one.
 
 ### "My family/team should each have their own" — a few people
 
@@ -371,8 +371,8 @@ claude mcp add --transport http mail https://mail.example.com/mcp \
 
 ### Production, multiple users, Google OAuth
 
-Needed if you want Claude.ai, ChatGPT or Grok web connectors, which negotiate OAuth
-and cannot send a static header.
+Needed if you want Claude.ai or ChatGPT web connectors, which negotiate OAuth and
+cannot send a static header, or Grok's connectors to sign in with OAuth.
 
 Create a Google OAuth **Web application** and configure:
 
