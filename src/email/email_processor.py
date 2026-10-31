@@ -3,15 +3,19 @@
 import asyncio
 import contextlib
 import logging
+import math
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List
 
+import httpx
 from sqlalchemy import func, or_
 
 from src.database.connection import SessionLocal, get_db_session
 from src.email import sanitize_db_text
-from src.email.gmail_api_client import GmailApiClient, GmailHistoryExpired
+from src.email.gmail_api_client import GmailApiClient, GmailHistoryExpired, GmailRateLimited
 from src.email.message_flags import apply_flag_state, normalize_flags
 from src.email.smtp_client import SMTPClient
 from src.email.text_extractor import TextExtractor
@@ -22,6 +26,10 @@ from src.models.smtp_config import SMTPConfig
 from src.services.message_metadata import content_fingerprint, participant_models
 
 logger = logging.getLogger(__name__)
+
+# How providers word a throttle in an error text. Phrases, not bare "rate" or
+# "429": those occur in message ids, subjects and words like "generate".
+THROTTLE_PHRASES = ("rate limit", "rate-limit", "ratelimit", "rate exceeded", "too many requests", "throttl")
 
 
 def upsert_placement(
@@ -160,6 +168,13 @@ def release_mailbox_lease(db, token: str) -> None:
         synchronize_session=False,
     )
     db.commit()
+
+
+@dataclass
+class _GmailRunProgress:
+    """Work a Gmail synchronization run committed, which its next run will not redo."""
+
+    steps: int = 0
 
 
 def _chunks(values, size: int = 1000):
@@ -345,10 +360,31 @@ def reap_tombstoned_messages(db, *, config_id: int, now: datetime | None = None)
 class EmailProcessor:
     """Main email processing orchestrator."""
 
+    # Throttle waits stop this long before the job's deadline: twice httpx's 30 s
+    # timeout (which applies per connect, read and write, not per request), so the
+    # requests in flight and committing what arrived normally finish while the
+    # lease still fences the writes. A slower run is still ended by the supervisor.
+    GMAIL_THROTTLE_MARGIN_SECONDS = 60.0
+    GMAIL_HISTORY_PAGE_SIZE = 100
+
+    @classmethod
+    def _history_page_size(cls, last_error_code: str | None, consecutive_failures: int | None) -> int:
+        """Smaller history pages while throttles keep ending runs before a page is done.
+
+        Halved for each consecutive failed run when the last failure was a
+        throttle, down to one change; full size again once a run saves its place,
+        which resets the failure count.
+        """
+        if last_error_code != "PROVIDER_RATE_LIMITED":
+            return cls.GMAIL_HISTORY_PAGE_SIZE
+        return max(1, cls.GMAIL_HISTORY_PAGE_SIZE >> min(consecutive_failures or 0, 7))
+
     def __init__(self):
         self.active_clients = {}
         self.processing = False
         self._active_lock_tokens = {}
+        # The supervised job's monotonic work deadline, set by the sync worker.
+        self.job_deadline: float | None = None
 
     async def start_processing(self):
         """Start the email processing loop."""
@@ -500,16 +536,28 @@ class EmailProcessor:
                     config_id,
                 )
                 return False
-            failures = max(1, int(getattr(config, "consecutive_failures", 0) or 0) + 1)
-            retry_seconds = min(3600, 30 * (2 ** min(failures - 1, 7)))
-            self._mark_sync_failure(config_id, e, failures, retry_seconds)
-            logger.error(
-                "Error processing server %s: %s: %r; retrying in %ss",
-                getattr(config, "name", "unknown"),
-                type(e).__name__,
-                e,
-                retry_seconds,
-            )
+            if isinstance(e, GmailRateLimited) and e.made_progress:
+                # Throttled, but this run committed work: slow progress, not a failure.
+                retry_seconds = max(30, math.ceil(e.retry_after))
+                self._mark_sync_throttled(config_id, retry_seconds)
+                logger.warning(
+                    "Gmail is rate-limiting account %s; it made progress and continues in %ss",
+                    config_id,
+                    retry_seconds,
+                )
+            else:
+                failures = max(1, int(getattr(config, "consecutive_failures", 0) or 0) + 1)
+                retry_seconds = min(3600, 30 * (2 ** min(failures - 1, 7)))
+                if isinstance(e, GmailRateLimited):
+                    retry_seconds = max(retry_seconds, math.ceil(e.retry_after))
+                self._mark_sync_failure(config_id, e, failures, retry_seconds)
+                logger.error(
+                    "Error processing server %s: %s: %r; retrying in %ss",
+                    getattr(config, "name", "unknown"),
+                    type(e).__name__,
+                    e,
+                    retry_seconds,
+                )
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
@@ -530,11 +578,23 @@ class EmailProcessor:
     def _sync_error(exc: Exception) -> tuple[str, str]:
         message = str(exc).replace("\n", " ").strip()[:500]
         lowered = message.lower()
-        if "auth" in lowered or "login" in lowered:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        if isinstance(exc, GmailRateLimited) or status == 429:
+            code = "PROVIDER_RATE_LIMITED"
+        elif status is not None:
+            # An HTTP answer is classified by its status, not its text: the text
+            # carries the request URL, whose message ids can contain "429".
+            if status == 401:
+                code = "ACCOUNT_AUTH_FAILED"
+            elif status in (408, 504):
+                code = "PROVIDER_TIMEOUT"
+            else:
+                code = "PROVIDER_SYNC_FAILED"
+        elif "auth" in lowered or "login" in lowered:
             code = "ACCOUNT_AUTH_FAILED"
         elif "timeout" in lowered or "timed out" in lowered:
             code = "PROVIDER_TIMEOUT"
-        elif "rate" in lowered or "429" in lowered:
+        elif any(phrase in lowered for phrase in THROTTLE_PHRASES):
             code = "PROVIDER_RATE_LIMITED"
         else:
             code = "PROVIDER_SYNC_FAILED"
@@ -643,6 +703,20 @@ class EmailProcessor:
             account.retry_at = None
 
     @staticmethod
+    def _mark_sync_throttled(config_id: int, retry_seconds: int) -> None:
+        """Gmail slowed this mailbox down while the run still made progress."""
+        now = datetime.now(tz=timezone.utc)
+        with SessionLocal.begin() as db:
+            account = db.query(SMTPConfig).filter(SMTPConfig.id == config_id).one()
+            account.sync_state = "healthy" if account.backfill_complete else "backfilling"
+            account.last_error_code = "PROVIDER_RATE_LIMITED"
+            account.last_error_message = (
+                f"Gmail is rate-limiting this mailbox; synchronization continues in {retry_seconds}s"
+            )
+            account.consecutive_failures = 0
+            account.retry_at = now + timedelta(seconds=retry_seconds)
+
+    @staticmethod
     def _mark_sync_interrupted(config_id: int) -> None:
         with SessionLocal.begin() as db:
             account = db.query(SMTPConfig).filter(SMTPConfig.id == config_id).one()
@@ -673,9 +747,18 @@ class EmailProcessor:
                 synchronize_session=False,
             )
 
+    def _gmail_throttle_deadline(self) -> float:
+        from src.config import settings
+
+        deadline = self.job_deadline
+        if deadline is None:
+            deadline = time.monotonic() + settings.sync_job_timeout_seconds
+        return deadline - self.GMAIL_THROTTLE_MARGIN_SECONDS
+
     async def _process_gmail_api(self, config: SMTPConfig) -> None:
         """Use Gmail history checkpoints for OAuth-backed Gmail accounts."""
-        client = GmailApiClient(config)
+        client = GmailApiClient(config, throttle_deadline=self._gmail_throttle_deadline())
+        progress = _GmailRunProgress()
         try:
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
@@ -683,35 +766,48 @@ class EmailProcessor:
                 history_id = account.provider_sync_token
 
             if not initial_sync_complete:
-                await self._process_gmail_backfill(config, client)
+                await self._process_gmail_backfill(config, client, progress)
                 return
 
             if not history_id:
                 self._reset_gmail_backfill(config.id)
-                await self._process_gmail_backfill(config, client)
+                await self._process_gmail_backfill(config, client, progress)
                 return
 
             try:
-                await self._process_gmail_history(config, client, history_id)
+                await self._process_gmail_history(config, client, history_id, progress)
             except GmailHistoryExpired:
                 logger.warning(
                     "Gmail history expired for account %s; starting a resumable full sync",
                     config.id,
                 )
                 self._reset_gmail_backfill(config.id)
-                await self._process_gmail_backfill(config, client)
+                await self._process_gmail_backfill(config, client, progress)
+        except GmailRateLimited as exc:
+            # Decided here, after the interrupted chunk's messages were committed.
+            exc.made_progress = progress.steps > 0
+            raise
         finally:
             await client.close()
 
     async def _process_gmail_backfill(
-        self, config: SMTPConfig, client: GmailApiClient
+        self,
+        config: SMTPConfig,
+        client: GmailApiClient,
+        progress: _GmailRunProgress | None = None,
     ) -> None:
         """Process a bounded number of Gmail listing pages and persist progress."""
         from src.config import settings
 
+        if progress is None:
+            progress = _GmailRunProgress()
+        # A full sync in progress has its snapshot. Every path that starts a new
+        # one clears provider_sync_token, so a run cut short on its first page --
+        # before any page token was saved -- resumes the same generation instead
+        # of starting another and fetching that page again.
         with get_db_session() as db:
             account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
-            needs_snapshot = not account.initial_sync_complete and not account.sync_page_token
+            needs_snapshot = not account.initial_sync_complete and not account.provider_sync_token
 
         if needs_snapshot:
             profile = await client.get_profile()
@@ -720,7 +816,7 @@ class EmailProcessor:
                 raise RuntimeError("Gmail profile did not include a history ID")
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
-                if not account.initial_sync_complete and not account.sync_page_token:
+                if not account.initial_sync_complete and not account.provider_sync_token:
                     account.sync_generation = (account.sync_generation or 0) + 1
                     account.provider_sync_token = history_id
                     account.backfill_complete = False
@@ -740,22 +836,29 @@ class EmailProcessor:
                 max_results=settings.gmail_page_size,
             )
             message_ids = [str(item["id"]) for item in page.get("messages", [])]
-            processed_count, missing_ids = await self._fetch_and_process_gmail_messages(
+
+            async def committed(count: int) -> None:
+                # Recorded with this generation, so never fetched again by it.
+                progress.steps += count
+                await self._update_server_stats(config, count)
+
+            _processed, missing_ids = await self._fetch_and_process_gmail_messages(
                 client,
-                message_ids,
+                self._not_yet_seen(config.id, message_ids, generation),
                 sync_generation=generation,
+                on_committed=committed,
             )
-            if processed_count:
-                await self._update_server_stats(config, processed_count)
 
             next_page_token = page.get("nextPageToken")
             if next_page_token:
                 with get_db_session() as db:
                     account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
                     account.sync_page_token = str(next_page_token)
+                progress.steps += 1
                 continue
 
             self._complete_gmail_backfill(config.id, generation)
+            progress.steps += 1
             logger.info(
                 "Completed Gmail full sync generation %s for account %s (%s vanished during fetch)",
                 generation,
@@ -769,16 +872,26 @@ class EmailProcessor:
         config: SMTPConfig,
         client: GmailApiClient,
         start_history_id: str,
+        progress: _GmailRunProgress | None = None,
     ) -> None:
-        """Apply bounded Gmail history pages without advancing early."""
+        """Apply bounded Gmail history pages without advancing early.
+
+        Progress is a saved checkpoint: a page cut short is fetched again in full,
+        so re-fetching it is not progress.
+        """
         from src.config import settings
 
+        if progress is None:
+            progress = _GmailRunProgress()
+        with get_db_session() as db:
+            account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
+            page_size = self._history_page_size(account.last_error_code, account.consecutive_failures)
         for _ in range(settings.gmail_history_pages_per_cycle):
             with get_db_session() as db:
                 account = db.query(SMTPConfig).filter(SMTPConfig.id == config.id).one()
                 page_token = account.sync_page_token
 
-            page = await client.list_history(start_history_id, page_token=page_token)
+            page = await client.list_history(start_history_id, page_token=page_token, max_results=page_size)
             changed_ids, deleted_ids = self._gmail_history_changes(page)
             processed_count, missing_ids = await self._fetch_and_process_gmail_messages(
                 client,
@@ -798,6 +911,7 @@ class EmailProcessor:
                         page.get("historyId") or start_history_id
                     )
                     account.sync_page_token = None
+            progress.steps += 1
             if not next_page_token:
                 return
 
@@ -807,8 +921,12 @@ class EmailProcessor:
         message_ids: list[str],
         *,
         sync_generation: int | None = None,
+        on_committed=None,
     ) -> tuple[int, set[str]]:
-        """Fetch and commit small RFC822 chunks to cap peak memory use."""
+        """Fetch and commit small RFC822 chunks to cap peak memory use.
+
+        ``on_committed(count)`` is awaited after each chunk's messages commit.
+        """
         from src.config import settings
 
         concurrency = max(1, settings.gmail_request_concurrency)
@@ -816,20 +934,53 @@ class EmailProcessor:
         missing: set[str] = set()
         for offset in range(0, len(message_ids), concurrency):
             chunk_ids = message_ids[offset : offset + concurrency]
+            # Let every fetch of the chunk settle, so none is left running
+            # unobserved, and keep what arrived before re-raising a failure.
             fetched = await asyncio.gather(
-                *(client.get_parsed_message(message_id) for message_id in chunk_ids)
+                *(client.get_parsed_message(message_id) for message_id in chunk_ids),
+                return_exceptions=True,
             )
             messages = []
+            failure: BaseException | None = None
             for message_id, message in zip(chunk_ids, fetched, strict=True):
+                if isinstance(message, BaseException):
+                    if failure is None:
+                        failure = message
+                    continue
                 if message is None:
                     missing.add(message_id)
                     continue
                 if sync_generation is not None:
                     message["last_seen_sync_generation"] = sync_generation
                 messages.append(message)
-            await self._process_emails(messages)
+            try:
+                await self._process_emails(messages)
+            except BaseException as error:
+                if failure is not None and error is not failure:
+                    raise error from failure
+                raise
             processed_count += len(messages)
+            if on_committed is not None and messages:
+                await on_committed(len(messages))
+            if failure is not None:
+                raise failure
         return processed_count, missing
+
+    @staticmethod
+    def _not_yet_seen(config_id: int, message_ids: list[str], generation: int | None) -> list[str]:
+        """The listed messages this full sync has not recorded yet, in listed order."""
+        if not message_ids or generation is None:
+            return list(message_ids)
+        with get_db_session() as db:
+            seen = {
+                provider_message_id
+                for (provider_message_id,) in db.query(EmailLog.provider_message_id).filter(
+                    EmailLog.smtp_config_id == config_id,
+                    EmailLog.provider_message_id.in_(message_ids),
+                    EmailLog.last_seen_sync_generation == generation,
+                )
+            }
+        return [message_id for message_id in message_ids if message_id not in seen]
 
     @staticmethod
     def _gmail_history_changes(page: dict) -> tuple[set[str], set[str]]:

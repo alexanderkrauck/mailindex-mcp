@@ -2,6 +2,72 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.3.3 — 2026-10-31
+
+### Gmail throttling slows a synchronization down instead of failing it
+
+- Gmail enforces each mailbox's quota over seconds to a minute and answers with
+  403 `rateLimitExceeded` (or 429) once it is used up. The client did not retry
+  the 403 at all: during a catch-up, ten parallel fetches used up the quota, the
+  run failed, and the account showed `error` / `PROVIDER_SYNC_FAILED` until a
+  retry minutes later used it up again.
+- Now a throttle starts a throttled period for that client. Every request waits
+  behind one shared pause: 5 s, then 10, 20, 40 and 60 s for each further
+  throttle in the period, or as long as a `Retry-After` asks (1 s to 5 minutes).
+  Between pauses, requests start one at a time, ten a second. The period ends
+  once a minute passes after a pause without another throttle. Answers to
+  requests that were already in flight when a pause began do not lengthen it.
+  Any other 403 is still final.
+- A synchronization never waits past its job's deadline, less a minute: no
+  pause and no paced slot may end later. When one would, the run stops, keeps
+  what it fetched, and records where it stopped. A run that committed work
+  (messages newly recorded for a full sync, or a saved checkpoint) stays
+  `backfilling` (or `healthy`) with `last_error_code` `PROVIDER_RATE_LIMITED`,
+  a `retry_at` and its failure count reset. A run that committed nothing counts
+  as a failure, retried no sooner than Gmail asked.
+- A full sync cut short resumes where it stopped. It no longer starts a new
+  generation when its first page did not finish, and it skips the messages it
+  already recorded on a page it is repeating. History is read in pages of 100
+  rather than 500 changes. While throttles keep ending runs before a page is
+  done, each next run asks for pages half as large (halved for every
+  consecutive failed run, down to one change), so one can finish and save its
+  place; a run that saves its place returns to full pages.
+- A synchronization error from one of Gmail's HTTP answers is classified by its
+  status, not by words in its text. The text includes the request URL, so a 500
+  for a message whose id happened to contain "429" showed as rate limiting.
+  Other error texts count as throttling only for phrases such as "rate limit",
+  "too many requests" or "throttled", no longer for a bare "rate" or "429".
+- A tool call (a label change, a move to Trash, a permanent deletion, a draft, an
+  attachment fetch) waits at most 15 seconds, then answers `RATE_LIMITED` with
+  `retry_after`: the remaining pause, or once paced requests run out of time,
+  the length of the last pause. Label changes and permanent deletions Gmail did
+  apply before that are recorded in the index, and the answer says how many.
+- Parallel requests that need a new access token share one refresh, and a late
+  401 for the old token no longer discards the new one.
+- A chunk of parallel fetches now lets every fetch finish, and keeps the messages
+  that arrived, before it re-raises a failure.
+
+### Permanent deletion on Gmail accounts connected by OAuth works
+
+- `delete_mail` with `permanent: true` always failed on these accounts. It called
+  `POST messages/{id}/delete`, a route Gmail does not have (it answers 404), and
+  fell back to Gmail's real route, `DELETE messages/{id}`, only on a 405 that
+  never came. It now calls `DELETE` directly, through the same throttle handling
+  and token refresh as every other Gmail call.
+- Gmail deletes a message whatever its labels are, and the index can be behind
+  Gmail. So each message's labels are read from Gmail first, and only one Gmail
+  itself still has in the Bin or Spam is deleted. One restored since the index
+  last saw it is left alone, its new place is recorded, and the answer lists it
+  as skipped, also when the call ends throttled or refused (with the advice to
+  leave it out of a retry).
+- A message Gmail no longer has counts as deleted. Any other refusal stays an
+  error, including a 404 that is not Gmail's own "not found".
+- Asked to delete mail that is not in the Bin, the answer now names the
+  messages, and no longer tells the caller to move them there first without
+  saying that one someone restored was taken out on purpose. This check and the
+  live one both go by Gmail's own Bin and Spam, not by the setting that hides
+  folders from search.
+
 ## v0.3.2 — 2026-10-31
 
 ### Grok can connect

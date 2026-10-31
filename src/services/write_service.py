@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +33,8 @@ from src.email.email_processor import (
 from src.email.gmail_labels import (
     ARCHIVE,
     LOCATIONS,
+    SPAM,
+    TRASH,
     labels_for_move,
     location_for,
     parse_labels,
@@ -81,6 +84,12 @@ MARKS = {
 }
 
 _recent_writes: dict[int, list[datetime]] = {}
+
+
+def _some_ids(ids) -> str:
+    """Up to twenty ids for a message, in order."""
+    ordered = sorted(ids)
+    return ", ".join(str(i) for i in ordered[:20]) + (", ..." if len(ordered) > 20 else "")
 
 
 def _rate_limit(user_id: int) -> None:
@@ -519,18 +528,17 @@ async def delete_mail(
             )
             return _outcome(selection, limit, permanent=False, to="TRASH", moved=changed)
 
-        outside = [
-            message.id
-            for message, placement in selection.targets
-            if not is_excluded_folder(placement.folder, suffixes)
-        ]
+        # The same definition as the live check below: Gmail's Bin and Spam, not
+        # the search-exclusion setting.
+        outside = [message.id for message, placement in selection.targets if placement.folder not in (TRASH, SPAM)]
         if outside:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"{len(outside)} of these messages are not in Gmail's Bin yet. Send "
-                    "them there first; only a message already in Trash can be removed "
-                    "permanently."
+                    f"{len(outside)} of these messages are not in Gmail's Bin or Spam "
+                    f"(email ids {_some_ids(outside)}). Only a message already there can be "
+                    "removed permanently. Move one to the Bin first only if it is meant to "
+                    "go: a message someone restored from the Bin was taken out on purpose."
                 ),
             )
 
@@ -539,16 +547,62 @@ async def delete_mail(
 
             async def one(message):
                 async with semaphore:
+                    # Gmail deletes a message whatever its labels say, and the
+                    # index can be behind Gmail: a message restored from the Bin
+                    # there must not be destroyed here. So read where it is now.
+                    labels = await client.get_labels(message.provider_message_id)
+                    if labels is None:
+                        return None  # Gmail no longer has it
+                    # Gmail's own labels, not the search-exclusion setting, which
+                    # an operator may widen to hide other mail from search.
+                    if not {TRASH, SPAM} & set(labels):
+                        return labels
                     await client.delete_message_permanently(message.provider_message_id)
+                    return None
 
-            await asyncio.gather(*(one(message) for message, _p in selection.targets))
+            # Every deletion settles, so the ones Gmail did are recorded even
+            # when another was throttled or refused.
+            return await asyncio.gather(
+                *(one(message) for message, _p in selection.targets), return_exceptions=True
+            )
 
-        await _gmail(db, selection.account, destroy)
+        results = await _gmail(db, selection.account, destroy)
         now = datetime.now(tz=timezone.utc)
-        for message, placement in selection.targets:
+        removed = 0
+        kept: list[tuple[EmailLog, MessagePlacement]] = []
+        left_in_place: list[int] = []
+        failure: BaseException | None = None
+        for target, result in zip(selection.targets, results, strict=True):
+            message, placement = target
+            if isinstance(result, BaseException):
+                failure = failure or result
+                kept.append(target)
+                continue
+            if result is not None:
+                # Moved out of the Bin or Spam in Gmail: record where it is now.
+                _record_gmail_labels(db, message, result)
+                left_in_place.append(message.id)
+                selection.skipped.append(
+                    {"email_id": message.id, "reason": "no longer in Trash or Spam in Gmail; left in place"}
+                )
+                continue
+            kept.append(target)
             db.delete(placement)
             message.deleted_at = now
+            removed += 1
         db.commit()
+        # Kept by identity: the commit expired every row, and reading an id back
+        # would reload each one.
+        selection.targets = kept
+        if failure is not None:
+            done = f"{removed} of {len(results)} messages were deleted permanently."
+            if left_in_place:
+                done += (
+                    " Left in place, because Gmail no longer has them in the Bin or Spam: "
+                    f"{len(left_in_place)} (email ids {_some_ids(left_in_place)}); leave them "
+                    "out when retrying."
+                )
+            _raise_gmail_failure(failure, done=done)
         return _outcome(selection, limit, permanent=True)
 
     if permanent:
@@ -931,6 +985,42 @@ def _is_gmail_api(account: SMTPConfig) -> bool:
     return account.provider == "gmail" and account.auth_type == "oauth2"
 
 
+def _gmail_failure(exc: BaseException, *, done: str = "") -> BaseException:
+    """The HTTPException a tool call answers with for a Gmail failure; others unchanged.
+
+    ``done`` says what of a batch Gmail did before the failure, e.g. "2 of 3
+    messages were deleted permanently."
+    """
+    from src.email.gmail_api_client import GmailRateLimited
+
+    if isinstance(exc, GmailRateLimited):
+        return HTTPException(
+            status_code=429,
+            detail={
+                "message": " ".join(
+                    part for part in ("Gmail is rate-limiting this mailbox.", done, "Retry shortly to continue.") if part
+                ),
+                "retry_after": math.ceil(exc.retry_after),
+            },
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
+        return HTTPException(
+            status_code=502,
+            detail=(
+                f"Gmail refused the change: {exc.response.status_code} {exc.response.text[:200]}"
+                + (f". {done}" if done else "")
+            ),
+        )
+    return exc
+
+
+def _raise_gmail_failure(failure: BaseException, *, done: str):
+    mapped = _gmail_failure(failure, done=done)
+    if mapped is failure:
+        raise failure
+    raise mapped from failure
+
+
 async def _gmail(db: Session, account: SMTPConfig, operation):
     """Run an operation against the Gmail API under the mailbox lease.
 
@@ -938,7 +1028,7 @@ async def _gmail(db: Session, account: SMTPConfig, operation):
     renumber -- but the Gmail sync reconciles by history id, and a relabel landing
     mid-pass is still a change the pass did not see.
     """
-    from src.email.gmail_api_client import GmailApiClient
+    from src.email.gmail_api_client import GmailApiClient, GmailRateLimited
 
     deadline = datetime.now(tz=timezone.utc) + timedelta(
         seconds=settings.mail_write_lease_wait_seconds
@@ -965,11 +1055,8 @@ async def _gmail(db: Session, account: SMTPConfig, operation):
     client = GmailApiClient(SMTPConfig.create_detached(account))
     try:
         return await operation(client)
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gmail refused the change: {exc.response.status_code} {exc.response.text[:200]}",
-        ) from exc
+    except (GmailRateLimited, httpx.HTTPStatusError) as exc:
+        raise _gmail_failure(exc) from exc
     finally:
         keepalive.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1006,17 +1093,27 @@ async def _gmail_relabel(
             )
 
     async def operation(client):
+        # Every change settles before this returns, so the ones Gmail applied are
+        # recorded even when another was throttled or refused.
         return await asyncio.gather(
-            *(one(client, message) for message, _placement in selection.targets)
+            *(one(client, message) for message, _placement in selection.targets),
+            return_exceptions=True,
         )
 
     results = await _gmail(db, selection.account, operation)
     changed = 0
-    for message, labels in results:
+    failure: BaseException | None = None
+    for result in results:
+        if isinstance(result, BaseException):
+            failure = failure or result
+            continue
+        message, labels = result
         if labels is None:
             selection.skipped.append({"email_id": message.id, "reason": "Gmail did not confirm"})
             continue
         _record_gmail_labels(db, message, labels)
         changed += 1
     db.commit()
+    if failure is not None:
+        _raise_gmail_failure(failure, done=f"{changed} of {len(results)} messages now have the requested labels.")
     return changed
