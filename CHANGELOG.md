@@ -2,6 +2,27 @@
 
 Notable changes. Dates are release dates; the git history is finer grained.
 
+## v0.3.2 — 2026-10-31
+
+### Grok can connect
+
+- Grok's custom connectors can now add the server. Grok registers itself through
+  dynamic client registration with the callback
+  `https://grok.com/connectors-oauth-exchange-code/`. The default list of
+  allowed client callbacks did not include it, so `/register` answered
+  `invalid_redirect_uri` before any sign-in page appeared, and nothing was
+  logged. The default now allows that callback with and without the trailing
+  slash, and the same path on `console.x.ai`, assumed for connectors a team
+  admin sets up there. They are exact paths, not wildcards; as for the existing
+  claude.ai entry, FastMCP compares scheme, host, port and path, not a query or
+  fragment.
+- A deployment that sets `EMAILSERVER_ALLOWED_CLIENT_REDIRECT_URIS` replaces the
+  default list and has to add these URIs itself.
+- A registration refused for its callback is now logged as a warning naming the
+  client and the callback it asked for, so the next client that cannot connect
+  shows what to allow. Registrations the MCP SDK refuses earlier, for their
+  scope, grant type or response type, are still not logged.
+
 ## v0.3.1 — 2026-10-16
 
 ### Drafts keep their text on Exchange Online

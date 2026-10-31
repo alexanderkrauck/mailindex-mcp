@@ -143,6 +143,13 @@ class Settings(BaseSettings):
     allowed_client_redirect_uris: list[str] = [
         "https://claude.ai/api/mcp/auth_callback",
         "https://chatgpt.com/connector/oauth/*",
+        # Grok's custom connectors on grok.com; the console.x.ai pair is assumed
+        # for connectors a team admin provisions there. Exact URIs, with and
+        # without the trailing slash, rather than a wildcard on xAI's hosts.
+        "https://grok.com/connectors-oauth-exchange-code/",
+        "https://grok.com/connectors-oauth-exchange-code",
+        "https://console.x.ai/connectors-oauth-exchange-code/",
+        "https://console.x.ai/connectors-oauth-exchange-code",
         "http://localhost:*",
         "http://127.0.0.1:*",
     ]

@@ -195,3 +195,101 @@ def test_chatgpt_dynamic_connector_callback_is_allowlisted():
         "https://chatgpt.com/other/oauth/rpYtr-3A0Ot6",
         settings.allowed_client_redirect_uris,
     )
+
+
+GROK_CALLBACKS = [
+    "https://grok.com/connectors-oauth-exchange-code/",
+    "https://grok.com/connectors-oauth-exchange-code",
+    "https://console.x.ai/connectors-oauth-exchange-code/",
+    "https://console.x.ai/connectors-oauth-exchange-code",
+]
+
+
+def test_grok_connector_callbacks_are_allowlisted_and_lookalikes_are_not():
+    from fastmcp.server.auth.redirect_validation import validate_redirect_uri
+
+    from src.config import settings
+
+    for callback in GROK_CALLBACKS:
+        assert validate_redirect_uri(callback, settings.allowed_client_redirect_uris), callback
+    for lookalike in (
+        "https://grok.com.evil.example/connectors-oauth-exchange-code/",
+        "https://evil.example/connectors-oauth-exchange-code/",
+        "https://x.ai/connectors-oauth-exchange-code/",
+        "https://grok.com/connectors-oauth-exchange-code/elsewhere",
+        "https://grok.com/connectors-oauth-exchange-code/../elsewhere",
+        "https://someone@grok.com/connectors-oauth-exchange-code/",
+        "http://grok.com/connectors-oauth-exchange-code/",
+    ):
+        assert not validate_redirect_uri(lookalike, settings.allowed_client_redirect_uris), lookalike
+
+
+@pytest.mark.asyncio
+async def test_grok_can_register_itself_by_dynamic_client_registration(caplog):
+    """Grok's first step. Before its callback was allowed, this answered 400 invalid_redirect_uri."""
+    import logging
+
+    from fastmcp import FastMCP
+    from httpx import ASGITransport, AsyncClient
+    from key_value.aio.stores.memory import MemoryStore
+
+    from src.config import settings
+    from src.security.google_oauth import McpGoogleProvider
+
+    provider = McpGoogleProvider(
+        client_id="test.apps.googleusercontent.com",
+        client_secret="test-secret",
+        base_url="https://mail.example.com",
+        resource_base_url="https://mail.example.com",
+        required_scopes=settings.google_required_scopes,
+        valid_scopes=settings.google_required_scopes,
+        allowed_client_redirect_uris=settings.allowed_client_redirect_uris,
+        jwt_signing_key="long-enough-test-signing-key",
+        client_storage=MemoryStore(),
+    )
+    app = FastMCP("auth-test", auth=provider).http_app(path="/mcp")
+
+    def registration(callback: str) -> dict:
+        return {
+            "client_name": "Grok",
+            "redirect_uris": [callback],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="https://mail.example.com") as client:
+        for callback in GROK_CALLBACKS:
+            response = await client.post("/register", json=registration(callback))
+            assert response.status_code == 201, response.text
+            assert response.json()["redirect_uris"] == [callback]
+        assert not [r for r in caplog.records if r.name == "src.security.google_oauth"]
+
+        lookalike = "https://grok.com.evil.example/connectors-oauth-exchange-code/"
+        with caplog.at_level(logging.WARNING, logger="src.security.google_oauth"):
+            refused = await client.post("/register", json=registration(lookalike))
+        assert refused.status_code == 400
+        assert refused.json()["error"] == "invalid_redirect_uri"
+        # The refusal names the callback, so the next client that cannot connect is diagnosable.
+        logged = [r.getMessage() for r in caplog.records if r.name == "src.security.google_oauth"]
+        assert len(logged) == 1
+        assert "'Grok'" in logged[0] and lookalike in logged[0] and "invalid_redirect_uri" in logged[0]
+
+
+def test_google_mode_serves_the_provider_that_logs_refusals(monkeypatch, tmp_path):
+    """Production builds its provider here; the registration tests construct one directly."""
+    import fastmcp
+
+    from src.config import settings
+    from src.security import auth
+    from src.security.google_oauth import McpGoogleProvider
+
+    monkeypatch.setattr(fastmcp.settings, "home", tmp_path)
+    monkeypatch.setattr(settings, "auth_mode", "google")
+    monkeypatch.setattr(settings, "google_client_id", "test.apps.googleusercontent.com")
+    monkeypatch.setattr(settings, "google_client_secret", "test-secret")
+    monkeypatch.setattr(settings, "jwt_signing_key", "long-enough-test-signing-key")
+    monkeypatch.setattr(settings, "public_base_url", "https://mail.example.com")
+    monkeypatch.setattr(auth, "_mcp_auth_provider", None)
+
+    assert isinstance(auth.build_mcp_auth_provider(), McpGoogleProvider)

@@ -343,7 +343,7 @@ always separate from this.
 |---|---|---|---|
 | `development` | anyone on loopback | nothing | local clients only |
 | `single_user` | one owner with a static bearer token | a token, a domain | Claude Code, Cursor, `mcp-remote`, anything that sends a header |
-| `google` | multiple users via Google OAuth + dynamic client registration | a Google Cloud OAuth client, a domain | Claude.ai and ChatGPT web connectors, plus all of the above |
+| `google` | multiple users via Google OAuth + dynamic client registration | a Google Cloud OAuth client, a domain | Claude.ai, ChatGPT and Grok web connectors, plus all of the above |
 
 ### Production, single user, no Google project
 
@@ -372,7 +372,7 @@ claude mcp add --transport http mail https://mail.example.com/mcp \
 ### Production, multiple users, Google OAuth
 
 Needed if you want Claude.ai or ChatGPT web connectors, which negotiate OAuth and
-cannot send a static header.
+cannot send a static header, or Grok's connectors to sign in with OAuth.
 
 Create a Google OAuth **Web application** and configure:
 
@@ -382,7 +382,8 @@ Create a Google OAuth **Web application** and configure:
   - `https://mail.example.com/api/v1/accounts/gmail/callback`
 
 Do **not** add the AI vendor's callback to the Google client. The MCP server allows
-`https://claude.ai/api/mcp/auth_callback` and `https://chatgpt.com/connector/oauth/*`
+`https://claude.ai/api/mcp/auth_callback`, `https://chatgpt.com/connector/oauth/*` and
+Grok's `https://grok.com/connectors-oauth-exchange-code/` (also on `console.x.ai`)
 itself, then redirects the completed authorization back to the client.
 
 ```bash
